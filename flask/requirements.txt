@@ -1,0 +1,10 @@
+Flask
+Flask-RESTful
+Flask-CORS
+Flask-MySQLdb
+mysqlclient
+pytesseract
+Pillow
+opencv-python
+numpy
+joblib 
