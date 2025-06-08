@@ -9,6 +9,20 @@ from joblib import load
 import pandas as pd
 import io
 from werkzeug.security import generate_password_hash, check_password_hash
+import pytesseract
+from PIL import Image, ImageEnhance
+try:
+    from deskew import determine_skew
+except ImportError:
+    determine_skew = None  # If deskew is not installed, skip deskewing
+import time
+
+# Global constants
+TESSDATA_DIR = os.path.join(os.path.dirname(__file__), '..', 'Tesseract-OCR', 'tessdata')
+
+# Set pytesseract to use the local Tesseract-OCR binary
+pytesseract.pytesseract.tesseract_cmd = os.path.join(os.path.dirname(__file__), '..', 'Tesseract-OCR', 'tesseract.exe')
+# os.environ['TESSDATA_PREFIX'] = r'C:\Program Files\Tesseract-OCR'  # Not needed when using --tessdata-dir
 
 app = Flask(__name__)
 CORS(app)
@@ -81,43 +95,128 @@ def sort_boxes_top_to_bottom_left_to_right(boxes):
         sorted_boxes.extend(sorted_line)
     return sorted_boxes
 
-def predict_blocks(img):
+def preprocess_for_ocr(img):
+    """
+    This function now matches the notebook's pre_process_image logic exactly:
+    - Downscale by 0.3x
+    - Convert BGR to RGB, then to grayscale
+    - Adaptive thresholding with (5, 11)
+    """
+    # 1. Downscale by 0.3x
+    img = cv2.resize(img, None, fx=0.3, fy=0.3)
+    # 2. Convert BGR to RGB
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    # 3. Convert to grayscale
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # 4. Adaptive thresholding (blockSize=5, C=11)
+    img = cv2.adaptiveThreshold(img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 5, 11)
+    return img
+
+def get_tesseract_config(label, lang='eng'):
+    """Get optimized Tesseract configuration based on content type"""
+    base_config = f'--tessdata-dir {TESSDATA_DIR}'
+    
+    if label == 'Handwritten_extended':
+        return f'{base_config} --psm 6 --oem 1 -c tessedit_char_blacklist=|#<>_{{}} -c textord_heavy_nr=1 -c textord_noise_rejrows=1'
+    elif label == 'Printed_extended':
+        return f'{base_config} --psm 3 --oem 1 -c preserve_interword_spaces=1 -c tessedit_do_invert=0'
+    else:
+        return f'{base_config} --psm 4 --oem 1'
+
+def predict_blocks(img, language):
+    """
+    Detects text blocks using a safer preprocessing method, classifies them,
+    and returns sorted bounding boxes.
+    """
     original = img.copy()
     if len(img.shape) == 3:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     else:
-        gray = img
-    linek = np.zeros((11, 11), dtype=np.uint8)
-    linek[5, :] = 1
-    x = cv2.morphologyEx(gray, cv2.MORPH_OPEN, linek)
-    gray = gray - x
-    _, bw = cv2.threshold(gray, 10, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    bw = cv2.dilate(bw, np.ones((5, 5), np.uint8), iterations=1)
-    contours, _ = cv2.findContours(bw, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
-    bounding_boxes = [cv2.boundingRect(c) for c in contours]
+        gray = img.copy()
+
+    # Use a simpler, less destructive preprocessing for contour detection.
+    # The goal here is just to find the bounding boxes accurately.
+    # The heavy image enhancement for OCR is done later in ocr_region.
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    bw = cv2.adaptiveThreshold(
+        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV, 11, 4
+    )
+
+    # Use dilation to connect characters into words and words into lines
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 2))
+    dilated = cv2.dilate(bw, kernel, iterations=3)
+    
+    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    bounding_boxes = []
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        # Filter based on area to remove non-text objects
+        if w > 10 and h > 10:
+             bounding_boxes.append((x,y,w,h))
+    
+    # Sort boxes from top to bottom, then left to right
     sorted_boxes = sort_boxes_top_to_bottom_left_to_right(bounding_boxes)
-    sorted_contours = [contours[bounding_boxes.index(b)] for b in sorted_boxes]
+    
     results = []
     block_index = 0
-    for cnt in sorted_contours:
-        x, y, w, h = cv2.boundingRect(cnt)
-        if w < 10 or h < 10:
-            continue
+    for (x, y, w, h) in sorted_boxes:
         roi = original[y:y+h, x:x+w]
+        
+        # Skip if ROI is empty
+        if roi.size == 0:
+            continue
+
         feat = extract_features(roi)
         pred = model.predict([feat])[0]
+        
         try:
             pred_idx = int(pred)
             label = labels[pred_idx] if pred_idx < len(labels) else str(pred)
         except (ValueError, TypeError):
             label = str(pred)
+            
         results.append({
             'block_index': block_index,
             'label': label,
             'box': [int(x), int(y), int(w), int(h)]
         })
         block_index += 1
+        
     return results
+
+def ocr_region(region_img, label, lang='eng'):
+    """Enhanced OCR with better preprocessing and configuration"""
+    # Get optimal configuration
+    tessdata_config = get_tesseract_config(label, lang)
+
+    # Use the new, specific preprocessing for handwritten/mixed classes
+    if label in ['Handwritten_extended', 'Mixed_extended']:
+        pre_img = preprocess_for_ocr(region_img)
+        pil_img = Image.fromarray(pre_img)
+    else:
+        # For printed text, a simpler preprocessing is sufficient
+        if len(region_img.shape) == 3:
+            gray = cv2.cvtColor(region_img, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = region_img.copy()
+        
+        # Rescale for consistency
+        h, w = gray.shape
+        if h < 100: # A smaller threshold for printed text
+             scale_factor = 200 / h
+             gray = cv2.resize(gray, None, fx=scale_factor, fy=scale_factor, interpolation=cv2.INTER_CUBIC)
+
+        pil_img = Image.fromarray(gray)
+        
+    # Perform OCR
+    try:
+        text = pytesseract.image_to_string(pil_img, lang=lang, config=tessdata_config)
+        return text.strip()
+    except Exception as e:
+        print(f"OCR Error: {str(e)}")
+        return ""
 
 @app.route('/')
 def health_check():
@@ -157,8 +256,45 @@ def classify_blocks():
     img = cv2.imdecode(data, cv2.IMREAD_COLOR)
     if img is None:
         return jsonify({'error': 'Invalid image'}), 400
-    results = predict_blocks(img)
-    return jsonify({'results': results}), 200
+    language = request.form.get('language', 'en')  # default to English
+    t0 = time.time()
+    results = predict_blocks(img, language)
+    t1 = time.time()
+    print(f"Block detection/classification took {t1 - t0:.2f} seconds")
+    print(f"Number of regions detected: {len(results)}")
+    # For each region, run OCR and add recognized text
+    ocr_results = []
+    t2 = time.time()
+    for region in results:
+        x, y, w, h = region['box']
+        roi = img[y:y+h, x:x+w]
+        t_start = time.time()
+        text = ocr_region(roi, region['label'], lang=language)
+        print(f"OCR for region {region['block_index']} took {time.time() - t_start:.2f} seconds")
+        ocr_results.append({
+            'block_index': region['block_index'],
+            'label': region['label'],
+            'box': region['box'],
+            'text': text
+        })
+    t3 = time.time()
+    print(f"Total OCR time: {t3 - t2:.2f} seconds")
+    print(f"Total /classify endpoint time: {t3 - t0:.2f} seconds")
+
+    # Store recognized text in the results table
+    # Try to find the image in the images table by filename
+    filename = file.filename
+    cur = mysql.connection.cursor()
+    cur.execute("SELECT id FROM images WHERE image_path LIKE %s ORDER BY uploaded_at DESC LIMIT 1", (f"%{filename}",))
+    row = cur.fetchone()
+    if row:
+        image_id = row[0]
+        recognized_text = "".join([block['text'] for block in ocr_results])
+        cur.execute("INSERT INTO results (image_id, recognized_text) VALUES (%s, %s)", (image_id, recognized_text))
+        mysql.connection.commit()
+    cur.close()
+
+    return jsonify({'results': ocr_results}), 200
 
 @app.route('/register', methods=['POST'])
 def register():
@@ -198,4 +334,4 @@ def login():
     return jsonify({'message': 'Login successful', 'user_id': user_id}), 200
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0') 
+    app.run(debug=True, host='0.0.0.0')
