@@ -218,6 +218,105 @@ def ocr_region(region_img, label, lang='eng'):
         print(f"OCR Error: {str(e)}")
         return ""
 
+def detect_text_regions_tesseract(img, psm=1):
+    """
+    Use Tesseract's layout analysis to detect text regions (bounding boxes) only.
+    Returns a list of dicts: {left, top, width, height}
+    """
+    custom_config = f'--psm {psm} --oem 1'
+    data = pytesseract.image_to_data(img, config=custom_config, output_type=pytesseract.Output.DICT)
+    boxes = []
+    n_boxes = len(data['level'])
+    for i in range(n_boxes):
+        # Only keep boxes with some text detected (block/line/word)
+        if int(data['width'][i]) > 0 and int(data['height'][i]) > 0:
+            boxes.append({
+                'left': int(data['left'][i]),
+                'top': int(data['top'][i]),
+                'width': int(data['width'][i]),
+                'height': int(data['height'][i])
+            })
+    return boxes
+
+
+def classify_region_rf(roi_img):
+    """
+    Extract features from ROI and classify using the trained RF model.
+    Returns 'Handwritten' or 'Printed'.
+    """
+    features = extract_features(roi_img)
+    pred = model.predict([features])[0]
+    try:
+        pred_idx = int(pred)
+        label = labels[pred_idx] if pred_idx < len(labels) else str(pred)
+    except (ValueError, TypeError):
+        label = str(pred)
+    return label
+
+
+def preprocess_handwritten_region(roi_img):
+    """
+    Custom preprocessing for handwritten regions: contrast, denoise, deskew.
+    """
+    # Contrast enhancement
+    pil_img = Image.fromarray(cv2.cvtColor(roi_img, cv2.COLOR_BGR2RGB))
+    enhancer = ImageEnhance.Contrast(pil_img)
+    pil_img = enhancer.enhance(2.0)
+    img = np.array(pil_img)
+    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    # Convert to grayscale
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # Deskew
+    if determine_skew is not None:
+        angle = determine_skew(gray)
+        if angle is not None and abs(angle) < 45:
+            (h, w) = gray.shape
+            center = (w // 2, h // 2)
+            M = cv2.getRotationMatrix2D(center, angle, 1.0)
+            gray = cv2.warpAffine(gray, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+    # Denoise
+    denoised = cv2.fastNlMeansDenoising(gray, h=30, templateWindowSize=7, searchWindowSize=21)
+    # Adaptive threshold
+    binarized = cv2.adaptiveThreshold(
+        denoised, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY, 31, 15
+    )
+    return binarized
+
+
+def pipeline_document_image(img, psm=1, lang='eng'):
+    """
+    Full pipeline: detect regions, classify, OCR with appropriate preprocessing.
+    Returns a list of dicts: {box, label, text}
+    """
+    results = []
+    boxes = detect_text_regions_tesseract(img, psm=psm)
+    for box in boxes:
+        x, y, w, h = box['left'], box['top'], box['width'], box['height']
+        roi = img[y:y+h, x:x+w]
+        if roi.size == 0:
+            continue
+        label = classify_region_rf(roi)
+        if label.lower().startswith('handwritten'):
+            proc_img = preprocess_handwritten_region(roi)
+            pil_img = Image.fromarray(proc_img)
+            tess_config = '--psm 6 --oem 1'
+        else:
+            # Printed: simple grayscale
+            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) if len(roi.shape) == 3 else roi.copy()
+            pil_img = Image.fromarray(gray)
+            tess_config = '--psm 3 --oem 1'
+        try:
+            text = pytesseract.image_to_string(pil_img, lang=lang, config=tess_config)
+        except Exception as e:
+            text = ''
+        results.append({
+            'box': [x, y, w, h],
+            'label': label,
+            'text': text.strip()
+        })
+    return results
+
 @app.route('/')
 def health_check():
     return jsonify({'status': 'Flask backend is running.'})
@@ -332,6 +431,27 @@ def login():
     if not check_password_hash(pw_hash, password):
         return jsonify({'error': 'Invalid username or password'}), 401
     return jsonify({'message': 'Login successful', 'user_id': user_id}), 200
+
+@app.route('/test_tess', methods=['POST'])
+def test_tess():
+    if 'image' not in request.files:
+        return jsonify({'error': 'No image part'}), 400
+    file = request.files['image']
+    if file.filename == '':
+        return jsonify({'error': 'No selected file'}), 400
+    filename = secure_filename(file.filename)
+    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+    file.save(filepath)
+    img = cv2.imread(filepath)
+    if img is None:
+        return jsonify({'error': 'Invalid image'}), 400
+    pil_img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    tess_config = f'--tessdata-dir {TESSDATA_DIR} --psm 3 --oem 1'
+    try:
+        text = pytesseract.image_to_string(pil_img, config=tess_config)
+    except Exception as e:
+        return jsonify({'error': f'OCR error: {str(e)}'}), 500
+    return jsonify({'text': text.strip()}), 200
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0')

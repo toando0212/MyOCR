@@ -235,7 +235,7 @@ public class MainActivity extends AppCompatActivity {
                     .build();
 
             Request request = new Request.Builder()
-                    .url("http://192.168.1.219:5000/upload")
+                    .url("http://192.168.1.132:5000/classify")
                     .post(requestBody)
                     .build();
 
@@ -282,7 +282,7 @@ public class MainActivity extends AppCompatActivity {
                 .build();
 
         Request request = new Request.Builder()
-                .url("http://192.168.1.219:5000/classify")
+                .url("http://192.168.1.132:5000/classify")
                 .post(requestBody)
                 .build();
 
@@ -311,6 +311,13 @@ public class MainActivity extends AppCompatActivity {
                             progressBar.setVisibility(View.GONE);
                             tvRecognizedText.setText(recognizedText.toString());
                         });
+                        // JSONObject json = new JSONObject(responseBody);
+                        // String text = json.getString("text");
+                        // runOnUiThread(() -> {
+                        //     progressBar.setVisibility(View.GONE);
+                        //     tvRecognizedText.setText(text);
+                        // });
+
                     } catch (Exception e) {
                         runOnUiThread(() -> {
                             tvRecognizedText.setText("Lỗi khi phân tích kết quả OCR: " + e.getMessage());

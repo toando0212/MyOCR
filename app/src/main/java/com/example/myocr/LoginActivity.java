@@ -72,7 +72,7 @@ public class LoginActivity extends AppCompatActivity {
             String username = params[0];
             String password = params[1];
             try {
-                URL url = new URL("http://192.168.1.219:5000/register"); // Use 10.0.2.2 for Android emulator
+                URL url = new URL("http://192.168.1.132:5000/register"); // Use 10.0.2.2 for Android emulator
                 HttpURLConnection conn = (HttpURLConnection) url.openConnection();
                 conn.setRequestMethod("POST");
                 conn.setRequestProperty("Content-Type", "application/json; utf-8");
@@ -131,7 +131,7 @@ public class LoginActivity extends AppCompatActivity {
             String username = params[0];
             String password = params[1];
             try {
-                URL url = new URL("http://192.168.1.219:5000/login");
+                URL url = new URL("http://192.168.1.132:5000/login");
                 HttpURLConnection conn = (HttpURLConnection) url.openConnection();
                 conn.setRequestMethod("POST");
                 conn.setRequestProperty("Content-Type", "application/json; utf-8");
