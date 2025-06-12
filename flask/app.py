@@ -186,33 +186,18 @@ def predict_blocks(img, language):
         
     return results
 
-def ocr_region(region_img, label, lang='eng'):
-    """Enhanced OCR with better preprocessing and configuration"""
-    # Get optimal configuration
-    tessdata_config = get_tesseract_config(label, lang)
-
-    # Use the new, specific preprocessing for handwritten/mixed classes
-    if label in ['Handwritten_extended', 'Mixed_extended']:
-        pre_img = preprocess_for_ocr(region_img)
-        pil_img = Image.fromarray(pre_img)
+def ocr_region(region_img, lang='eng'):
+    """
+    Nhận diện văn bản bằng Tesseract, không phân biệt nhãn, không tiền xử lý đặc biệt.
+    """
+    # Chuyển sang grayscale nếu cần
+    if len(region_img.shape) == 3:
+        gray = cv2.cvtColor(region_img, cv2.COLOR_BGR2GRAY)
     else:
-        # For printed text, a simpler preprocessing is sufficient
-        if len(region_img.shape) == 3:
-            gray = cv2.cvtColor(region_img, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = region_img.copy()
-        
-        # Rescale for consistency
-        h, w = gray.shape
-        if h < 100: # A smaller threshold for printed text
-             scale_factor = 200 / h
-             gray = cv2.resize(gray, None, fx=scale_factor, fy=scale_factor, interpolation=cv2.INTER_CUBIC)
-
-        pil_img = Image.fromarray(gray)
-        
-    # Perform OCR
+        gray = region_img.copy()
+    pil_img = Image.fromarray(gray)
     try:
-        text = pytesseract.image_to_string(pil_img, lang=lang, config=tessdata_config)
+        text = pytesseract.image_to_string(pil_img, lang=lang)
         return text.strip()
     except Exception as e:
         print(f"OCR Error: {str(e)}")
@@ -355,7 +340,68 @@ def classify_blocks():
     img = cv2.imdecode(data, cv2.IMREAD_COLOR)
     if img is None:
         return jsonify({'error': 'Invalid image'}), 400
-    language = request.form.get('language', 'en')  # default to English
+    language = request.form.get('language', 'eng')  # default to English
+
+    # If Vietnamese mode, use Tesseract for line segmentation, then VietOCR per line
+    if language.lower() in ['vie', 'vi', 'vietnamese']:
+        try:
+            from vietocr.tool.predictor import Predictor
+            from vietocr.tool.config import Cfg
+            import torch
+            import base64
+            from PIL import Image
+            import io as sysio
+            # Load config and model (cache globally if desired)
+            vietocr_config = Cfg.load_config_from_name('vgg_seq2seq')
+            vietocr_config['device'] = 'cpu'  # or 'cuda:0' if GPU is available
+            vietocr_predictor = Predictor(vietocr_config)
+            # 1. Detect lines using Tesseract
+            custom_config = '--psm 3 --oem 1'
+            data = pytesseract.image_to_data(img, config=custom_config, output_type=pytesseract.Output.DICT, lang='vie')
+            n_boxes = len(data['level'])
+            line_boxes = []
+            for i in range(n_boxes):
+                # Only keep lines (level==4) with some text
+                if data['level'][i] == 4 and int(data['width'][i]) > 0 and int(data['height'][i]) > 0 and data['text'][i].strip():
+                    x, y, w, h = int(data['left'][i]), int(data['top'][i]), int(data['width'][i]), int(data['height'][i])
+                    line_boxes.append((x, y, w, h))
+            # 2. For each line, crop and run VietOCR
+            ocr_results = []
+            img_for_draw = img.copy()
+            for idx, (x, y, w, h) in enumerate(line_boxes):
+                roi = img[y:y+h, x:x+w]
+                if roi.size == 0:
+                    continue
+                roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
+                pil_img = Image.fromarray(roi_rgb)
+                text = vietocr_predictor.predict(pil_img)
+                ocr_results.append({
+                    'block_index': idx,
+                    'label': 'VietOCR_line',
+                    'box': [x, y, w, h],
+                    'text': text
+                })
+                # Draw rectangle for visualization
+                cv2.rectangle(img_for_draw, (x, y), (x+w, y+h), (0, 255, 0), 2)
+            # 3. Encode visualization image as base64
+            _, buffer = cv2.imencode('.png', img_for_draw)
+            vis_base64 = base64.b64encode(buffer).decode('utf-8')
+        except Exception as e:
+            return jsonify({'error': f'VietOCR error: {str(e)}'}), 500
+        # Store recognized text in the results table
+        filename = file.filename
+        cur = mysql.connection.cursor()
+        cur.execute("SELECT id FROM images WHERE image_path LIKE %s ORDER BY uploaded_at DESC LIMIT 1", (f"%{filename}",))
+        row = cur.fetchone()
+        if row:
+            image_id = row[0]
+            recognized_text = "\n".join([block['text'] for block in ocr_results])
+            cur.execute("INSERT INTO results (image_id, recognized_text) VALUES (%s, %s)", (image_id, recognized_text))
+            mysql.connection.commit()
+        cur.close()
+        return jsonify({'results': ocr_results, 'visualization': vis_base64}), 200
+
+    # --- Existing logic for other languages ---
     t0 = time.time()
     results = predict_blocks(img, language)
     t1 = time.time()
@@ -368,7 +414,7 @@ def classify_blocks():
         x, y, w, h = region['box']
         roi = img[y:y+h, x:x+w]
         t_start = time.time()
-        text = ocr_region(roi, region['label'], lang=language)
+        text = ocr_region(roi, lang=language)
         print(f"OCR for region {region['block_index']} took {time.time() - t_start:.2f} seconds")
         ocr_results.append({
             'block_index': region['block_index'],

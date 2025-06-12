@@ -18,10 +18,20 @@ def classify_via_flask(image, language):
 	data = {'language': language}
 	response = requests.post(FLASK_URL, files=files, data=data)
 	if response.status_code != 200:
-		return image, "Error", "Error", None
+		# Return valid types for all outputs
+		return image, "Error", [], None
 	data = response.json()
 	img_np = np.array(pil_img).copy()
 	ocr_table = []
+
+	# Check if Vietnamese mode
+	if language.lower() in ['vie', 'vi', 'vietnamese']:
+		# Only show recognized text, no overlays or block info
+		# Assume only one result block for VietOCR
+		vietocr_text = data['results'][0]['text'] if data['results'] and 'text' in data['results'][0] else ''
+		return img_np, vietocr_text, [[0, 'VietOCR', vietocr_text]], None
+
+	# For other languages, keep existing block overlay logic
 	for block in data['results']:
 		x, y, w, h = block['box']
 		label = block['label']
