@@ -46,6 +46,13 @@
         android:text="Login"
         android:layout_marginTop="16dp" />
 
+    <Button
+        android:id="@+id/btnGuest"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Use as Guest"
+        android:layout_marginTop="8dp" />
+
     <TextView
         android:id="@+id/tvToggleMode"
         android:layout_width="wrap_content"

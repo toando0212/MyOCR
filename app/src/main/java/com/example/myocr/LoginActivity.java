@@ -20,7 +20,7 @@ import java.net.URL;
 public class LoginActivity extends AppCompatActivity {
     private EditText etUsername, etPassword, etConfirmPassword;
     private TextView tvError, tvToggleMode;
-    private Button btnAuth;
+    private Button btnAuth, btnGuest;
     private boolean isLoginMode = true;
 
     @Override
@@ -34,6 +34,7 @@ public class LoginActivity extends AppCompatActivity {
         tvError = findViewById(R.id.tvError);
         btnAuth = findViewById(R.id.btnAuth);
         tvToggleMode = findViewById(R.id.tvToggleMode);
+        btnGuest = findViewById(R.id.btnGuest);
 
         updateMode();
 
@@ -64,6 +65,13 @@ public class LoginActivity extends AppCompatActivity {
             isLoginMode = !isLoginMode;
             updateMode();
         });
+
+        btnGuest.setOnClickListener(v -> {
+            // Navigate to MainActivity as a guest
+            Intent intent = new Intent(LoginActivity.this, MainActivity.class);
+            startActivity(intent);
+            finish();
+        });
     }
 
     private class RegisterTask extends AsyncTask<String, Void, String> {
@@ -72,7 +80,7 @@ public class LoginActivity extends AppCompatActivity {
             String username = params[0];
             String password = params[1];
             try {
-                URL url = new URL("http://192.168.1.132:5000/register"); // Use 10.0.2.2 for Android emulator
+                URL url = new URL("http://192.168.1.229:5000/register"); // Use 10.0.2.2 for Android emulator
                 HttpURLConnection conn = (HttpURLConnection) url.openConnection();
                 conn.setRequestMethod("POST");
                 conn.setRequestProperty("Content-Type", "application/json; utf-8");
@@ -131,7 +139,7 @@ public class LoginActivity extends AppCompatActivity {
             String username = params[0];
             String password = params[1];
             try {
-                URL url = new URL("http://192.168.1.132:5000/login");
+                URL url = new URL("http://192.168.1.229:5000/login");
                 HttpURLConnection conn = (HttpURLConnection) url.openConnection();
                 conn.setRequestMethod("POST");
                 conn.setRequestProperty("Content-Type", "application/json; utf-8");

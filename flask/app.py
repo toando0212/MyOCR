@@ -6,301 +6,305 @@ from werkzeug.utils import secure_filename
 import cv2
 import numpy as np
 from joblib import load
-import pandas as pd
 import io
 from werkzeug.security import generate_password_hash, check_password_hash
-import pytesseract
-from PIL import Image, ImageEnhance
-try:
-    from deskew import determine_skew
-except ImportError:
-    determine_skew = None  # If deskew is not installed, skip deskewing
+from PIL import Image, ImageDraw, ImageFont
 import time
+import torch
+from transformers import TrOCRProcessor, VisionEncoderDecoderModel
+from doctr.models import detection_predictor
+from doctr.io import DocumentFile
+from vietocr.tool.predictor import Predictor
+from vietocr.tool.config import Cfg
+import math
+import base64
 
 # Global constants
-TESSDATA_DIR = os.path.join(os.path.dirname(__file__), '..', 'Tesseract-OCR', 'tessdata')
-
-# Set pytesseract to use the local Tesseract-OCR binary
-pytesseract.pytesseract.tesseract_cmd = os.path.join(os.path.dirname(__file__), '..', 'Tesseract-OCR', 'tesseract.exe')
-# os.environ['TESSDATA_PREFIX'] = r'C:\Program Files\Tesseract-OCR'  # Not needed when using --tessdata-dir
-
 app = Flask(__name__)
 CORS(app)
 
-# MySQL configuration (update with your credentials)
+# MySQL configuration
 app.config['MYSQL_HOST'] = 'localhost'
 app.config['MYSQL_USER'] = 'myocr_user'
 app.config['MYSQL_PASSWORD'] = '0212'
 app.config['MYSQL_DB'] = 'myocr_db'
 app.config['UPLOAD_FOLDER'] = 'uploads'
-
-# Ensure the upload folder exists
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
 mysql = MySQL(app)
 
-# Load model and label file
-MODEL_PATH = '../Handwritten-and-Printed-Text-Classification-in-Doctors-Prescription/Handwritten-and-Printed-Text-Classification-in-Doctors-Prescription/full_model.joblib'
-LABEL_PATH = '../res2.csv'
-model = load(MODEL_PATH)
-labels = pd.read_csv(LABEL_PATH, header=None)[0].tolist()
+# --- Model Loading ---
+print("Loading models...")
+# Classifier for handwritten/printed text
+MODEL_PATH = 'full_model.joblib'
+try:
+    classifier_model = load(MODEL_PATH)
+    print("Classifier model loaded.")
+except Exception as e:
+    print(f"Could not load classifier model: {e}")
+    classifier_model = None
+
+# Doctr for line segmentation
+det_model = detection_predictor(arch="db_mobilenet_v3_large", pretrained=True)
+print("DocTR detection model loaded.")
+
+# VietOCR for Vietnamese text recognition
+vietocr_config = Cfg.load_config_from_name('vgg_seq2seq')
+vietocr_config['device'] = 'cpu'
+vietocr_config['predictor']['beamsearch'] = False
+vietocr_predictor = Predictor(vietocr_config)
+print("VietOCR model loaded.")
+
+# TrOCR for English text recognition
+printed_processor = TrOCRProcessor.from_pretrained("microsoft/trocr-small-printed")
+printed_model = VisionEncoderDecoderModel.from_pretrained("microsoft/trocr-small-printed")
+printed_model.to("cpu")
+print("TrOCR Printed model loaded.")
+
+handwritten_processor = TrOCRProcessor.from_pretrained("microsoft/trocr-small-handwritten")
+handwritten_model = VisionEncoderDecoderModel.from_pretrained("microsoft/trocr-small-handwritten")
+handwritten_model.to("cpu")
+print("TrOCR Handwritten model loaded.")
+print("All models loaded successfully.")
+
 
 def extract_features(img):
+    """Extracts features for the classifier from a given image region."""
     if len(img.shape) == 3:
         img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    rows = img.shape[0]
-    cols = img.shape[1]
+    
+    rows, cols = img.shape
+    if cols == 0 or rows == 0:
+        return [0, 0, 0, 0, 0]
+
     arr = [rows, cols, rows / cols if cols > 0 else 0]
-    retval, bwMask = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+    
+    _, bwMask = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+    
     myavg = 0
-    for xx in range(cols):
-        mycnt = 0
-        for yy in range(rows):
-            if bwMask[yy, xx] == 0:
-                mycnt += 1
-        myavg += (mycnt * 1.0) / rows
-    myavg /= cols if cols > 0 else 1
+    if cols > 0:
+        for xx in range(cols):
+            mycnt = np.sum(bwMask[:, xx] == 0)
+            myavg += (mycnt * 1.0) / rows
+        myavg /= cols
     arr.append(myavg)
+    
     change = 0
-    for xx in range(rows):
-        mycnt = 0
-        for yy in range(cols - 1):
-            if (bwMask[xx, yy] == 0) != (bwMask[xx, yy + 1] == 0):
-                mycnt += 1
-        change += (mycnt * 1.0) / cols if cols > 0 else 1
-    change /= rows if rows > 0 else 1
+    if rows > 0:
+        for xx in range(rows):
+            row_data = bwMask[xx, :]
+            mycnt = np.sum(row_data[:-1] != row_data[1:])
+            change += (mycnt * 1.0) / (cols if cols > 0 else 1)
+        change /= rows
     arr.append(change)
+    
     return arr
 
-def group_into_lines(boxes, y_threshold=10):
-    lines = []
-    for box in sorted(boxes, key=lambda b: b[1]):  # sort by top y
-        x, y, w, h = box
-        placed = False
-        for line in lines:
-            _, ly, _, lh = line[0]
-            if abs(y - ly) < y_threshold:  # same line
-                line.append(box)
-                placed = True
-                break
-        if not placed:
-            lines.append([box])
-    return lines
-
-def sort_boxes_top_to_bottom_left_to_right(boxes):
-    lines = group_into_lines(boxes)
-    sorted_boxes = []
-    for line in lines:
-        sorted_line = sorted(line, key=lambda b: b[0])  # sort by x
-        sorted_boxes.extend(sorted_line)
-    return sorted_boxes
-
-def preprocess_for_ocr(img):
-    """
-    This function now matches the notebook's pre_process_image logic exactly:
-    - Downscale by 0.3x
-    - Convert BGR to RGB, then to grayscale
-    - Adaptive thresholding with (5, 11)
-    """
-    # 1. Downscale by 0.3x
-    img = cv2.resize(img, None, fx=0.3, fy=0.3)
-    # 2. Convert BGR to RGB
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    # 3. Convert to grayscale
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    # 4. Adaptive thresholding (blockSize=5, C=11)
-    img = cv2.adaptiveThreshold(img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 5, 11)
-    return img
-
-def get_tesseract_config(label, lang='eng'):
-    """Get optimized Tesseract configuration based on content type"""
-    base_config = f'--tessdata-dir {TESSDATA_DIR}'
-    
-    if label == 'Handwritten_extended':
-        return f'{base_config} --psm 6 --oem 1 -c tessedit_char_blacklist=|#<>_{{}} -c textord_heavy_nr=1 -c textord_noise_rejrows=1'
-    elif label == 'Printed_extended':
-        return f'{base_config} --psm 3 --oem 1 -c preserve_interword_spaces=1 -c tessedit_do_invert=0'
-    else:
-        return f'{base_config} --psm 4 --oem 1'
-
-def predict_blocks(img, language):
-    """
-    Detects text blocks using a safer preprocessing method, classifies them,
-    and returns sorted bounding boxes.
-    """
-    original = img.copy()
-    if len(img.shape) == 3:
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = img.copy()
-
-    # Use a simpler, less destructive preprocessing for contour detection.
-    # The goal here is just to find the bounding boxes accurately.
-    # The heavy image enhancement for OCR is done later in ocr_region.
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    bw = cv2.adaptiveThreshold(
-        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV, 11, 4
-    )
-
-    # Use dilation to connect characters into words and words into lines
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 2))
-    dilated = cv2.dilate(bw, kernel, iterations=3)
-    
-    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    bounding_boxes = []
-    for cnt in contours:
-        x, y, w, h = cv2.boundingRect(cnt)
-        # Filter based on area to remove non-text objects
-        if w > 10 and h > 10:
-             bounding_boxes.append((x,y,w,h))
-    
-    # Sort boxes from top to bottom, then left to right
-    sorted_boxes = sort_boxes_top_to_bottom_left_to_right(bounding_boxes)
-    
-    results = []
-    block_index = 0
-    for (x, y, w, h) in sorted_boxes:
-        roi = original[y:y+h, x:x+w]
-        
-        # Skip if ROI is empty
-        if roi.size == 0:
-            continue
-
-        feat = extract_features(roi)
-        pred = model.predict([feat])[0]
-        
-        try:
-            pred_idx = int(pred)
-            label = labels[pred_idx] if pred_idx < len(labels) else str(pred)
-        except (ValueError, TypeError):
-            label = str(pred)
-            
-        results.append({
-            'block_index': block_index,
-            'label': label,
-            'box': [int(x), int(y), int(w), int(h)]
-        })
-        block_index += 1
-        
-    return results
-
-def ocr_region(region_img, lang='eng'):
-    """
-    Nhận diện văn bản bằng Tesseract, không phân biệt nhãn, không tiền xử lý đặc biệt.
-    """
-    # Chuyển sang grayscale nếu cần
-    if len(region_img.shape) == 3:
-        gray = cv2.cvtColor(region_img, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = region_img.copy()
-    pil_img = Image.fromarray(gray)
+def classify_region(roi_img):
+    """Classifies an image region as 'Handwritten' or 'Printed'."""
+    if classifier_model is None:
+        return "Printed" # Default if model is not available
     try:
-        text = pytesseract.image_to_string(pil_img, lang=lang)
-        return text.strip()
+        features = extract_features(np.array(roi_img))
+        pred = classifier_model.predict([features])[0]
+        return str(pred)
     except Exception as e:
-        print(f"OCR Error: {str(e)}")
-        return ""
+        print(f"Classification failed: {e}")
+        return "Unknown"
 
-def detect_text_regions_tesseract(img, psm=1):
-    """
-    Use Tesseract's layout analysis to detect text regions (bounding boxes) only.
-    Returns a list of dicts: {left, top, width, height}
-    """
-    custom_config = f'--psm {psm} --oem 1'
-    data = pytesseract.image_to_data(img, config=custom_config, output_type=pytesseract.Output.DICT)
-    boxes = []
-    n_boxes = len(data['level'])
-    for i in range(n_boxes):
-        # Only keep boxes with some text detected (block/line/word)
-        if int(data['width'][i]) > 0 and int(data['height'][i]) > 0:
-            boxes.append({
-                'left': int(data['left'][i]),
-                'top': int(data['top'][i]),
-                'width': int(data['width'][i]),
-                'height': int(data['height'][i])
-            })
-    return boxes
-
-
-def classify_region_rf(roi_img):
-    """
-    Extract features from ROI and classify using the trained RF model.
-    Returns 'Handwritten' or 'Printed'.
-    """
-    features = extract_features(roi_img)
-    pred = model.predict([features])[0]
+def deskew_image(pil_img: Image.Image) -> Image.Image:
+    """Detects the skew angle of the text in the image and rotates it to be straight."""
     try:
-        pred_idx = int(pred)
-        label = labels[pred_idx] if pred_idx < len(labels) else str(pred)
-    except (ValueError, TypeError):
-        label = str(pred)
-    return label
+        img = np.array(pil_img.convert("L"))
+        img_inverted = cv2.bitwise_not(img)
+        thresh = cv2.threshold(img_inverted, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
+        lines = cv2.HoughLinesP(thresh, 1, np.pi / 180, 100, minLineLength=100, maxLineGap=10)
 
+        if lines is None:
+            return pil_img
 
-def preprocess_handwritten_region(roi_img):
-    """
-    Custom preprocessing for handwritten regions: contrast, denoise, deskew.
-    """
-    # Contrast enhancement
-    pil_img = Image.fromarray(cv2.cvtColor(roi_img, cv2.COLOR_BGR2RGB))
-    enhancer = ImageEnhance.Contrast(pil_img)
-    pil_img = enhancer.enhance(2.0)
-    img = np.array(pil_img)
-    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-    # Convert to grayscale
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    # Deskew
-    if determine_skew is not None:
-        angle = determine_skew(gray)
-        if angle is not None and abs(angle) < 45:
-            (h, w) = gray.shape
-            center = (w // 2, h // 2)
-            M = cv2.getRotationMatrix2D(center, angle, 1.0)
-            gray = cv2.warpAffine(gray, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-    # Denoise
-    denoised = cv2.fastNlMeansDenoising(gray, h=30, templateWindowSize=7, searchWindowSize=21)
-    # Adaptive threshold
-    binarized = cv2.adaptiveThreshold(
-        denoised, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY, 31, 15
-    )
-    return binarized
+        angles = [math.degrees(math.atan2(y2 - y1, x2 - x1)) for line in lines for x1, y1, x2, y2 in line]
+        median_angle = np.median(angles)
 
+        if abs(median_angle) < 1:
+            return pil_img
 
-def pipeline_document_image(img, psm=1, lang='eng'):
-    """
-    Full pipeline: detect regions, classify, OCR with appropriate preprocessing.
-    Returns a list of dicts: {box, label, text}
-    """
-    results = []
-    boxes = detect_text_regions_tesseract(img, psm=psm)
-    for box in boxes:
-        x, y, w, h = box['left'], box['top'], box['width'], box['height']
-        roi = img[y:y+h, x:x+w]
-        if roi.size == 0:
+        (h, w) = img.shape[:2]
+        center = (w // 2, h // 2)
+        M = cv2.getRotationMatrix2D(center, median_angle, 1.0)
+        rotated = cv2.warpAffine(np.array(pil_img), M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+        return Image.fromarray(rotated)
+    except Exception as e:
+        print(f"Error during image deskewing: {e}")
+        return pil_img
+
+def remove_horizontal_lines(pil_img):
+    try:
+        img = np.array(pil_img)
+        if img.ndim == 3:
+            img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+        if img.mean() > 127:
+            img = 255 - img
+        horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 1))
+        detected_lines = cv2.morphologyEx(img, cv2.MORPH_OPEN, horizontal_kernel, iterations=2)
+        img_no_lines = cv2.subtract(img, detected_lines)
+        img_no_lines = 255 - img_no_lines
+        return Image.fromarray(img_no_lines)
+    except Exception as e:
+        print(f"Error in horizontal line removal: {e}")
+        return pil_img
+
+def doctr_segment_lines(pil_img):
+    """Segments an image into lines of text using DocTR."""
+    temp_path = None
+    try:
+        temp_path = "temp_input_doctr.png"
+        pil_img.convert("RGB").save(temp_path)
+        
+        doc = DocumentFile.from_images(temp_path)
+        result = det_model(doc)
+        
+        if not result or 'words' not in result[0] or result[0]['words'].shape[0] == 0:
+            return []
+
+        page = result[0]
+        img_width, img_height = pil_img.size
+        words = [
+            (int(w[0] * img_width), int(w[1] * img_height), int(w[2] * img_width), int(w[3] * img_height))
+            for w in page['words'][:, :-1]
+        ]
+        words.sort(key=lambda w: (w[1], w[0]))
+
+        if not words:
+            return []
+
+        lines = []
+        current_line = [words[0]]
+        for box in words[1:]:
+            last_box = current_line[-1]
+            last_box_y_center = (last_box[1] + last_box[3]) / 2
+            current_box_y_center = (box[1] + box[3]) / 2
+            last_box_height = last_box[3] - last_box[1]
+
+            if abs(current_box_y_center - last_box_y_center) < last_box_height * 0.7:
+                current_line.append(box)
+            else:
+                min_x = min(b[0] for b in current_line)
+                min_y = min(b[1] for b in current_line)
+                max_x = max(b[2] for b in current_line)
+                max_y = max(b[3] for b in current_line)
+                lines.append((min_x, min_y, max_x, max_y))
+                current_line = [box]
+        
+        if current_line:
+            min_x = min(b[0] for b in current_line)
+            min_y = min(b[1] for b in current_line)
+            max_x = max(b[2] for b in current_line)
+            max_y = max(b[3] for b in current_line)
+            lines.append((min_x, min_y, max_x, max_y))
+
+        return lines
+    except Exception as e:
+        print(f"Error in line segmentation: {e}")
+        return []
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
+
+@torch.no_grad()
+def run_english_pipeline(pil_img):
+    """Full English OCR pipeline."""
+    # 1. Preprocessing
+    deskewed_img = deskew_image(pil_img)
+    processed_img = remove_horizontal_lines(deskewed_img)
+    
+    # 2. Line Detection
+    line_boxes = doctr_segment_lines(processed_img)
+    if not line_boxes:
+        return [], pil_img
+
+    # 3. Recognition per line
+    ocr_results = []
+    vis_img = deskewed_img.copy().convert("RGB")
+    draw = ImageDraw.Draw(vis_img)
+    try:
+        font = ImageFont.truetype("arial.ttf", 15)
+    except IOError:
+        font = ImageFont.load_default()
+
+    for i, box in enumerate(line_boxes):
+        x_min, y_min, x_max, y_max = box
+        crop = processed_img.crop((x_min, y_min, x_max, y_max))
+        
+        if np.array(crop).std() < 10:
             continue
-        label = classify_region_rf(roi)
-        if label.lower().startswith('handwritten'):
-            proc_img = preprocess_handwritten_region(roi)
-            pil_img = Image.fromarray(proc_img)
-            tess_config = '--psm 6 --oem 1'
+
+        line_label = classify_region(crop.convert("RGB"))
+        
+        if 'handwritten' in line_label.lower():
+            processor, model = handwritten_processor, handwritten_model
         else:
-            # Printed: simple grayscale
-            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) if len(roi.shape) == 3 else roi.copy()
-            pil_img = Image.fromarray(gray)
-            tess_config = '--psm 3 --oem 1'
-        try:
-            text = pytesseract.image_to_string(pil_img, lang=lang, config=tess_config)
-        except Exception as e:
-            text = ''
-        results.append({
-            'box': [x, y, w, h],
-            'label': label,
-            'text': text.strip()
-        })
-    return results
+            processor, model = printed_processor, printed_model
+        
+        pixel_values = processor(images=crop.convert("RGB"), return_tensors="pt").pixel_values
+        generated_ids = model.generate(pixel_values)
+        text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
+        
+        if len(text) < 2:
+            continue
+
+        ocr_results.append({'block_index': i, 'box': box, 'label': line_label, 'text': text})
+        
+        color = "green" if 'handwritten' in line_label.lower() else "blue"
+        draw.rectangle(box, outline=color, width=2)
+        display_text = f"[{line_label}] {text}"
+        text_position = (box[0], box[1] - 15 if box[1] > 15 else box[1])
+        draw.text(text_position, display_text, fill=color, font=font)
+        
+    return ocr_results, vis_img
+
+@torch.no_grad()
+def run_vietnamese_pipeline(pil_img):
+    """Full Vietnamese OCR pipeline."""
+    # 1. Preprocessing
+    deskewed_img = deskew_image(pil_img)
+    processed_img = remove_horizontal_lines(deskewed_img)
+    
+    # 2. Line Detection
+    line_boxes = doctr_segment_lines(processed_img)
+    if not line_boxes:
+        return [], pil_img
+
+    # 3. Recognition per line
+    ocr_results = []
+    vis_img = deskewed_img.copy().convert("RGB")
+    draw = ImageDraw.Draw(vis_img)
+
+    for i, box in enumerate(line_boxes):
+        x_min, y_min, x_max, y_max = box
+        crop = processed_img.crop((x_min, y_min, x_max, y_max))
+        
+        if np.array(crop).std() < 10:
+            continue
+            
+        text = vietocr_predictor.predict(crop)
+        
+        if len(text) < 2:
+            continue
+            
+        ocr_results.append({'block_index': i, 'box': box, 'label': 'Vietnamese', 'text': text})
+        
+        draw.rectangle(box, outline="orange", width=2)
+        text_position = (box[0], box[1] - 15 if box[1] > 15 else box[1])
+        draw.text(text_position, text, fill="orange")
+        
+    return ocr_results, vis_img
+
+def encode_image_to_base64(pil_img):
+    """Encodes a PIL image to a base64 string."""
+    buffered = io.BytesIO()
+    pil_img.save(buffered, format="PNG")
+    return base64.b64encode(buffered.getvalue()).decode('utf-8')
 
 @app.route('/')
 def health_check():
@@ -334,62 +338,32 @@ def classify_blocks():
     file = request.files['image']
     if file.filename == '':
         return jsonify({'error': 'No selected file'}), 400
-    in_memory_file = io.BytesIO()
-    file.save(in_memory_file)
-    data = np.frombuffer(in_memory_file.getvalue(), dtype=np.uint8)
-    img = cv2.imdecode(data, cv2.IMREAD_COLOR)
-    if img is None:
-        return jsonify({'error': 'Invalid image'}), 400
-    language = request.form.get('language', 'eng')  # default to English
+    
+    try:
+        in_memory_file = io.BytesIO()
+        file.save(in_memory_file)
+        data = np.frombuffer(in_memory_file.getvalue(), dtype=np.uint8)
+        img_cv = cv2.imdecode(data, cv2.IMREAD_COLOR)
+        if img_cv is None:
+            return jsonify({'error': 'Invalid image file'}), 400
+        
+        # Convert to PIL Image for pipelines
+        pil_img = Image.fromarray(cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB))
 
-    # If Vietnamese mode, use Tesseract for line segmentation, then VietOCR per line
-    if language.lower() in ['vie', 'vi', 'vietnamese']:
-        try:
-            from vietocr.tool.predictor import Predictor
-            from vietocr.tool.config import Cfg
-            import torch
-            import base64
-            from PIL import Image
-            import io as sysio
-            # Load config and model (cache globally if desired)
-            vietocr_config = Cfg.load_config_from_name('vgg_seq2seq')
-            vietocr_config['device'] = 'cpu'  # or 'cuda:0' if GPU is available
-            vietocr_predictor = Predictor(vietocr_config)
-            # 1. Detect lines using Tesseract
-            custom_config = '--psm 3 --oem 1'
-            data = pytesseract.image_to_data(img, config=custom_config, output_type=pytesseract.Output.DICT, lang='vie')
-            n_boxes = len(data['level'])
-            line_boxes = []
-            for i in range(n_boxes):
-                # Only keep lines (level==4) with some text
-                if data['level'][i] == 4 and int(data['width'][i]) > 0 and int(data['height'][i]) > 0 and data['text'][i].strip():
-                    x, y, w, h = int(data['left'][i]), int(data['top'][i]), int(data['width'][i]), int(data['height'][i])
-                    line_boxes.append((x, y, w, h))
-            # 2. For each line, crop and run VietOCR
-            ocr_results = []
-            img_for_draw = img.copy()
-            for idx, (x, y, w, h) in enumerate(line_boxes):
-                roi = img[y:y+h, x:x+w]
-                if roi.size == 0:
-                    continue
-                roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
-                pil_img = Image.fromarray(roi_rgb)
-                text = vietocr_predictor.predict(pil_img)
-                ocr_results.append({
-                    'block_index': idx,
-                    'label': 'VietOCR_line',
-                    'box': [x, y, w, h],
-                    'text': text
-                })
-                # Draw rectangle for visualization
-                cv2.rectangle(img_for_draw, (x, y), (x+w, y+h), (0, 255, 0), 2)
-            # 3. Encode visualization image as base64
-            _, buffer = cv2.imencode('.png', img_for_draw)
-            vis_base64 = base64.b64encode(buffer).decode('utf-8')
-        except Exception as e:
-            return jsonify({'error': f'VietOCR error: {str(e)}'}), 500
-        # Store recognized text in the results table
-        filename = file.filename
+        language = request.form.get('language', 'eng').lower()
+
+        if language in ['vie', 'vi', 'vietnamese']:
+            print("Running Vietnamese OCR pipeline...")
+            ocr_results, vis_img = run_vietnamese_pipeline(pil_img)
+        else:
+            print("Running English OCR pipeline...")
+            ocr_results, vis_img = run_english_pipeline(pil_img)
+
+        # Encode visualization image to base64
+        vis_base64 = encode_image_to_base64(vis_img)
+
+        # Store results in DB
+        filename = secure_filename(file.filename)
         cur = mysql.connection.cursor()
         cur.execute("SELECT id FROM images WHERE image_path LIKE %s ORDER BY uploaded_at DESC LIMIT 1", (f"%{filename}",))
         row = cur.fetchone()
@@ -399,47 +373,13 @@ def classify_blocks():
             cur.execute("INSERT INTO results (image_id, recognized_text) VALUES (%s, %s)", (image_id, recognized_text))
             mysql.connection.commit()
         cur.close()
+
+        print(f"Pipeline finished. Found {len(ocr_results)} text blocks.")
         return jsonify({'results': ocr_results, 'visualization': vis_base64}), 200
 
-    # --- Existing logic for other languages ---
-    t0 = time.time()
-    results = predict_blocks(img, language)
-    t1 = time.time()
-    print(f"Block detection/classification took {t1 - t0:.2f} seconds")
-    print(f"Number of regions detected: {len(results)}")
-    # For each region, run OCR and add recognized text
-    ocr_results = []
-    t2 = time.time()
-    for region in results:
-        x, y, w, h = region['box']
-        roi = img[y:y+h, x:x+w]
-        t_start = time.time()
-        text = ocr_region(roi, lang=language)
-        print(f"OCR for region {region['block_index']} took {time.time() - t_start:.2f} seconds")
-        ocr_results.append({
-            'block_index': region['block_index'],
-            'label': region['label'],
-            'box': region['box'],
-            'text': text
-        })
-    t3 = time.time()
-    print(f"Total OCR time: {t3 - t2:.2f} seconds")
-    print(f"Total /classify endpoint time: {t3 - t0:.2f} seconds")
-
-    # Store recognized text in the results table
-    # Try to find the image in the images table by filename
-    filename = file.filename
-    cur = mysql.connection.cursor()
-    cur.execute("SELECT id FROM images WHERE image_path LIKE %s ORDER BY uploaded_at DESC LIMIT 1", (f"%{filename}",))
-    row = cur.fetchone()
-    if row:
-        image_id = row[0]
-        recognized_text = "".join([block['text'] for block in ocr_results])
-        cur.execute("INSERT INTO results (image_id, recognized_text) VALUES (%s, %s)", (image_id, recognized_text))
-        mysql.connection.commit()
-    cur.close()
-
-    return jsonify({'results': ocr_results}), 200
+    except Exception as e:
+        print(f"Error in /classify endpoint: {e}")
+        return jsonify({'error': f'An unexpected error occurred: {str(e)}'}), 500
 
 @app.route('/register', methods=['POST'])
 def register():
@@ -477,27 +417,6 @@ def login():
     if not check_password_hash(pw_hash, password):
         return jsonify({'error': 'Invalid username or password'}), 401
     return jsonify({'message': 'Login successful', 'user_id': user_id}), 200
-
-@app.route('/test_tess', methods=['POST'])
-def test_tess():
-    if 'image' not in request.files:
-        return jsonify({'error': 'No image part'}), 400
-    file = request.files['image']
-    if file.filename == '':
-        return jsonify({'error': 'No selected file'}), 400
-    filename = secure_filename(file.filename)
-    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-    file.save(filepath)
-    img = cv2.imread(filepath)
-    if img is None:
-        return jsonify({'error': 'Invalid image'}), 400
-    pil_img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-    tess_config = f'--tessdata-dir {TESSDATA_DIR} --psm 3 --oem 1'
-    try:
-        text = pytesseract.image_to_string(pil_img, config=tess_config)
-    except Exception as e:
-        return jsonify({'error': f'OCR error: {str(e)}'}), 500
-    return jsonify({'text': text.strip()}), 200
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0')
