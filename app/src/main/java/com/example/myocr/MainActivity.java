@@ -234,9 +234,14 @@ public class MainActivity extends AppCompatActivity {
 
         int userId = 1; // Replace with actual user ID logic
 
-        // Upload each image to the server
+        // Process each image sequentially and append results
+        // Use a StringBuilder to accumulate text from all images
+        StringBuilder allRecognizedText = new StringBuilder();
+        int totalImages = imageUris.size();
+        int[] imagesProcessed = {0}; // Use an array to be modifiable inside lambda
+
         for (Uri imageUri : imageUris) {
-            uploadImageToServer(imageUri, userId);
+            performOcrForImage(imageUri, userId, allRecognizedText, totalImages, imagesProcessed);
         }
     }
 
@@ -249,34 +254,34 @@ public class MainActivity extends AppCompatActivity {
                 .show();
     }
 
-    private void uploadImageToServer(Uri imageUri, int userId) {
+    private void performOcrForImage(Uri imageUri, int userId, StringBuilder allRecognizedText, int totalImages, int[] imagesProcessed) {
         try {
-            // Open input stream from URI
             InputStream inputStream = getContentResolver().openInputStream(imageUri);
             if (inputStream == null) {
                 runOnUiThread(() -> Toast.makeText(this, "Cannot open image", Toast.LENGTH_SHORT).show());
                 return;
             }
 
-            // Create a temp file
             File tempFile = File.createTempFile("upload_", ".jpg", getCacheDir());
-            OutputStream outputStream = new FileOutputStream(tempFile);
-
-            // Copy input stream to temp file
-            byte[] buffer = new byte[4096];
-            int bytesRead;
-            while ((bytesRead = inputStream.read(buffer)) != -1) {
-                outputStream.write(buffer, 0, bytesRead);
+            try (OutputStream outputStream = new FileOutputStream(tempFile)) {
+                byte[] buffer = new byte[4096];
+                int bytesRead;
+                while ((bytesRead = inputStream.read(buffer)) != -1) {
+                    outputStream.write(buffer, 0, bytesRead);
+                }
+            } finally {
+                inputStream.close();
             }
-            outputStream.close();
-            inputStream.close();
 
             OkHttpClient client = new OkHttpClient.Builder()
                     .readTimeout(5, java.util.concurrent.TimeUnit.MINUTES)
+                    .connectTimeout(1, java.util.concurrent.TimeUnit.MINUTES) // Add connect timeout
+                    .writeTimeout(1, java.util.concurrent.TimeUnit.MINUTES) // Add write timeout
                     .build();
 
             RequestBody fileBody = RequestBody.create(tempFile, MediaType.parse("image/*"));
             String language = radioVietnamese.isChecked() ? "vie" : "eng";
+
             MultipartBody requestBody = new MultipartBody.Builder()
                     .setType(MultipartBody.FORM)
                     .addFormDataPart("image", tempFile.getName(), fileBody)
@@ -284,103 +289,76 @@ public class MainActivity extends AppCompatActivity {
                     .addFormDataPart("user_id", String.valueOf(userId))
                     .build();
 
+            // IMPORTANT: Use your actual server URL here
             Request request = new Request.Builder()
-                    .url("http://192.168.1.229:5000/classify")
+                    .url("https://3e8f-42-114-227-240.ngrok-free.app/classify")
                     .post(requestBody)
                     .build();
 
             client.newCall(request).enqueue(new Callback() {
                 @Override
-                public void onFailure(Call call, IOException e) {
+                public void onFailure(@NonNull Call call, @NonNull IOException e) {
                     runOnUiThread(() -> {
-                        Toast.makeText(MainActivity.this, "Upload failed: " + e.getMessage(), Toast.LENGTH_SHORT).show();
-                        progressBar.setVisibility(View.GONE);
+                        Toast.makeText(MainActivity.this, "OCR Request failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                        // Check if all images have been processed (even on failure)
+                        imagesProcessed[0]++;
+                        if (imagesProcessed[0] == totalImages) {
+                            progressBar.setVisibility(View.GONE);
+                        }
                     });
                 }
 
                 @Override
-                public void onResponse(Call call, Response response) throws IOException {
+                public void onResponse(@NonNull Call call, @NonNull Response response) throws IOException {
+                    final String responseBody = response.body().string();
                     if (response.isSuccessful()) {
-                        runOnUiThread(() -> Toast.makeText(MainActivity.this, "Upload successful!", Toast.LENGTH_SHORT).show());
-                        classifyImage(tempFile, language);
+                        try {
+                            JSONObject json = new JSONObject(responseBody);
+                            JSONArray results = json.getJSONArray("results");
+                            StringBuilder currentImageText = new StringBuilder();
+                            for (int i = 0; i < results.length(); i++) {
+                                JSONObject block = results.getJSONObject(i);
+                                currentImageText.append(block.getString("text")).append("\n");
+                            }
+                            // Append the result of the current image to the total
+                            allRecognizedText.append(currentImageText);
+
+                        } catch (Exception e) {
+                            runOnUiThread(() -> Toast.makeText(MainActivity.this, "Failed to parse OCR result", Toast.LENGTH_SHORT).show());
+                        }
                     } else {
-                        runOnUiThread(() -> {
-                            Toast.makeText(MainActivity.this, "Upload failed: " + response.message(), Toast.LENGTH_SHORT).show();
-                            progressBar.setVisibility(View.GONE);
+                         runOnUiThread(() -> {
+                            try {
+                                // Try to parse error message from server
+                                JSONObject json = new JSONObject(responseBody);
+                                String error = json.optString("error", response.message());
+                                Toast.makeText(MainActivity.this, "OCR failed: " + error, Toast.LENGTH_LONG).show();
+                            } catch (Exception e) {
+                                Toast.makeText(MainActivity.this, "OCR failed: " + response.message(), Toast.LENGTH_LONG).show();
+                            }
                         });
                     }
+
+                    // This block runs regardless of success or failure
+                    runOnUiThread(() -> {
+                        imagesProcessed[0]++;
+                        // If this is the last image, update the TextView and hide the progress bar
+                        if (imagesProcessed[0] == totalImages) {
+                            progressBar.setVisibility(View.GONE);
+                            tvRecognizedText.setText(allRecognizedText.toString());
+                            if(allRecognizedText.length() == 0) {
+                                tvRecognizedText.setText("No text recognized.");
+                            }
+                        }
+                    });
                 }
             });
 
         } catch (Exception e) {
             runOnUiThread(() -> {
-                Toast.makeText(this, "Upload failed: " + e.getMessage(), Toast.LENGTH_SHORT).show();
+                Toast.makeText(this, "Failed to process image: " + e.getMessage(), Toast.LENGTH_SHORT).show();
                 progressBar.setVisibility(View.GONE);
             });
         }
-    }
-
-    private void classifyImage(File imageFile, String language) {
-        OkHttpClient client = new OkHttpClient.Builder()
-                .readTimeout(5, java.util.concurrent.TimeUnit.MINUTES)
-                .build();
-        RequestBody fileBody = RequestBody.create(imageFile, MediaType.parse("image/*"));
-        MultipartBody requestBody = new MultipartBody.Builder()
-                .setType(MultipartBody.FORM)
-                .addFormDataPart("image", imageFile.getName(), fileBody)
-                .addFormDataPart("language", language)
-                .build();
-
-        Request request = new Request.Builder()
-                .url("http://192.168.1.229:5000/classify")
-                .post(requestBody)
-                .build();
-
-        client.newCall(request).enqueue(new Callback() {
-            @Override
-            public void onFailure(Call call, IOException e) {
-                runOnUiThread(() -> {
-                    Toast.makeText(MainActivity.this, "Classification failed: " + e.getMessage(), Toast.LENGTH_SHORT).show();
-                    progressBar.setVisibility(View.GONE);
-                });
-            }
-
-            @Override
-            public void onResponse(Call call, Response response) throws IOException {
-                if (response.isSuccessful()) {
-                    String responseBody = response.body().string();
-                    try {
-                        JSONObject json = new JSONObject(responseBody);
-                        JSONArray results = json.getJSONArray("results");
-                        StringBuilder recognizedText = new StringBuilder();
-                        for (int i = 0; i < results.length(); i++) {
-                            JSONObject block = results.getJSONObject(i);
-                            recognizedText.append(block.getString("text"));
-                        }
-                        runOnUiThread(() -> {
-                            progressBar.setVisibility(View.GONE);
-                            tvRecognizedText.setText(recognizedText.toString());
-                        });
-                        // JSONObject json = new JSONObject(responseBody);
-                        // String text = json.getString("text");
-                        // runOnUiThread(() -> {
-                        //     progressBar.setVisibility(View.GONE);
-                        //     tvRecognizedText.setText(text);
-                        // });
-
-                    } catch (Exception e) {
-                        runOnUiThread(() -> {
-                            tvRecognizedText.setText("Lỗi khi phân tích kết quả OCR: " + e.getMessage());
-                            progressBar.setVisibility(View.GONE);
-                        });
-                    }
-                } else {
-                    runOnUiThread(() -> {
-                        Toast.makeText(MainActivity.this, "Classification failed: " + response.message(), Toast.LENGTH_SHORT).show();
-                        progressBar.setVisibility(View.GONE);
-                    });
-                }
-            }
-        });
     }
 }

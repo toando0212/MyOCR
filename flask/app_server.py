@@ -14,7 +14,6 @@ import torch
 from transformers import TrOCRProcessor, VisionEncoderDecoderModel
 from doctr.models import detection_predictor
 from doctr.io import DocumentFile
-from doctr.models.builder import DocumentBuilder
 from vietocr.tool.predictor import Predictor
 from vietocr.tool.config import Cfg
 import math
@@ -24,11 +23,22 @@ import base64
 app = Flask(__name__)
 CORS(app)
 
-# MySQL configuration
-app.config['MYSQL_HOST'] = 'localhost'
-app.config['MYSQL_USER'] = 'myocr_user'
-app.config['MYSQL_PASSWORD'] = '0212'
-app.config['MYSQL_DB'] = 'myocr_db'
+# --- Server Environment Setup ---
+# Check for GPU and set the device for PyTorch models
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"INFO: Using device: {DEVICE}")
+
+# Font for visualization - place arial.ttf in the same directory as app.py
+FONT_PATH = os.path.join(os.path.dirname(__file__), "arial.ttf")
+if not os.path.exists(FONT_PATH):
+    print(f"WARNING: Font not found at {FONT_PATH}. Visualization may use a default font.")
+
+
+# MySQL configuration - IMPORTANT: Update these for your server's database
+app.config['MYSQL_HOST'] = 'localhost'      # Or the IP of your MySQL server
+app.config['MYSQL_USER'] = 'myocr_user'     # Your MySQL username
+app.config['MYSQL_PASSWORD'] = '0212'       # Your MySQL password
+app.config['MYSQL_DB'] = 'myocr_db'         # Your MySQL database name
 app.config['UPLOAD_FOLDER'] = 'uploads'
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
@@ -51,7 +61,7 @@ print("DocTR detection model loaded.")
 
 # VietOCR for Vietnamese text recognition
 vietocr_config = Cfg.load_config_from_name('vgg_seq2seq')
-vietocr_config['device'] = 'cpu'
+vietocr_config['device'] = DEVICE # Use 'cuda' or 'cpu'
 vietocr_config['predictor']['beamsearch'] = False
 vietocr_predictor = Predictor(vietocr_config)
 print("VietOCR model loaded.")
@@ -59,12 +69,12 @@ print("VietOCR model loaded.")
 # TrOCR for English text recognition
 printed_processor = TrOCRProcessor.from_pretrained("microsoft/trocr-small-printed")
 printed_model = VisionEncoderDecoderModel.from_pretrained("microsoft/trocr-small-printed")
-printed_model.to("cpu")
+printed_model.to(DEVICE) # Move model to GPU if available
 print("TrOCR Printed model loaded.")
 
 handwritten_processor = TrOCRProcessor.from_pretrained("microsoft/trocr-small-handwritten")
 handwritten_model = VisionEncoderDecoderModel.from_pretrained("microsoft/trocr-small-handwritten")
-handwritten_model.to("cpu")
+handwritten_model.to(DEVICE) # Move model to GPU if available
 print("TrOCR Handwritten model loaded.")
 print("All models loaded successfully.")
 
@@ -113,143 +123,27 @@ def classify_region(roi_img):
         print(f"Classification failed: {e}")
         return "Unknown"
 
-def correct_perspective(pil_img: Image.Image) -> Image.Image:
-    """
-    Corrects perspective distortion in an image of a document.
-    Finds the largest quadrilateral in the image and warps it to a top-down view.
-    This version includes a check to ensure the detected contour is large enough to be the document.
-    """
-    try:
-        img = np.array(pil_img.convert("RGB"))
-        orig = img.copy()
-        
-        # Downscale for faster processing, preserving aspect ratio
-        proc_height = 500.0
-        # Handle cases where the image is smaller than the processing height
-        if img.shape[0] <= proc_height:
-             ratio = 1.0
-             proc_img = img.copy()
-        else:
-             ratio = img.shape[0] / proc_height
-             proc_img = cv2.resize(img, (int(img.shape[1] / ratio), int(proc_height)))
-
-        # Edge detection
-        gray = cv2.cvtColor(proc_img, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (5, 5), 0)
-        edged = cv2.Canny(gray, 75, 200)
-
-        # Find contours
-        contours, _ = cv2.findContours(edged.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:5]
-
-        screenCnt = None
-        img_area = proc_img.shape[0] * proc_img.shape[1]
-
-        for c in contours:
-            peri = cv2.arcLength(c, True)
-            approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-            
-            # We are looking for a 4-point contour that is sufficiently large
-            if len(approx) == 4:
-                if cv2.contourArea(approx) > img_area * 0.20: # Must be at least 20% of the image
-                    screenCnt = approx
-                    break
-                else:
-                    # This logs that a small contour was found and skipped, which can be useful for debugging
-                    print(f"Info: Found a 4-point contour, but its area is too small. Skipping it.")
-        
-        if screenCnt is None:
-            print("Info: Could not find a suitable document contour. Skipping perspective correction.")
-            return pil_img
-        
-        print("Info: Found document contour, applying perspective correction.")
-
-        # Order the points for the perspective transform
-        pts = screenCnt.reshape(4, 2) * ratio
-        rect = np.zeros((4, 2), dtype="float32")
-        s = pts.sum(axis=1)
-        rect[0] = pts[np.argmin(s)] # Top-left
-        rect[2] = pts[np.argmax(s)] # Bottom-right
-        diff = np.diff(pts, axis=1)
-        rect[1] = pts[np.argmin(diff)] # Top-right
-        rect[3] = pts[np.argmax(diff)] # Bottom-left
-        
-        (tl, tr, br, bl) = rect
-
-        widthA = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
-        widthB = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
-        maxWidth = max(int(widthA), int(widthB))
-
-        heightA = np.sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
-        heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
-        maxHeight = max(int(heightA), int(heightB))
-
-        # Ensure the warped image dimensions are valid
-        if maxWidth <= 0 or maxHeight <= 0:
-            print("Warning: Calculated invalid dimensions for warped image. Skipping perspective correction.")
-            return pil_img
-
-        dst = np.array([
-            [0, 0],
-            [maxWidth - 1, 0],
-            [maxWidth - 1, maxHeight - 1],
-            [0, maxHeight - 1]], dtype="float32")
-
-        M = cv2.getPerspectiveTransform(rect, dst)
-        warped = cv2.warpPerspective(orig, M, (maxWidth, maxHeight))
-
-        return Image.fromarray(warped)
-    except Exception as e:
-        print(f"Error during perspective correction: {e}")
-        return pil_img
-
 def deskew_image(pil_img: Image.Image) -> Image.Image:
-    """
-    Deskews an image using the Projection Profile Method with adaptive thresholding.
-    """
+    """Detects the skew angle of the text in the image and rotates it to be straight."""
     try:
-        img_for_deskew = np.array(pil_img.convert("L"))
-        
-        # Adaptive thresholding is better for images with varying lighting.
-        thresh = cv2.adaptiveThreshold(img_for_deskew, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                       cv2.THRESH_BINARY_INV, 15, 5)
+        img = np.array(pil_img.convert("L"))
+        img_inverted = cv2.bitwise_not(img)
+        thresh = cv2.threshold(img_inverted, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
+        lines = cv2.HoughLinesP(thresh, 1, np.pi / 180, 100, minLineLength=100, maxLineGap=10)
 
-        max_score = -1.0
-        best_angle = 0.0
-
-        # Test a range of angles
-        for angle in np.arange(-15, 15, 0.5):
-            (h, w) = thresh.shape
-            center = (w // 2, h // 2)
-            M = cv2.getRotationMatrix2D(center, angle, 1.0)
-            
-            # Rotate the binary image using nearest-neighbor to avoid interpolation artifacts
-            rotated = cv2.warpAffine(thresh, M, (w, h), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-            
-            # Calculate horizontal projection profile
-            hist = np.sum(rotated, axis=1, dtype=np.float32) / 255.0
-            
-            # Score is the variance of the projection profile
-            score = np.sum((hist[1:] - hist[:-1]) ** 2)
-            
-            if score > max_score:
-                max_score = score
-                best_angle = angle
-        
-        print(f"Detected best skew angle: {best_angle:.2f} degrees")
-
-        # Use a stricter threshold to avoid over-correcting already straight images
-        if abs(best_angle) < 0.5:
-            print("Skew angle is insignificant, skipping rotation.")
+        if lines is None:
             return pil_img
 
-        # Rotate the original color image by the best angle for a high-quality result
-        (h, w) = img_for_deskew.shape[:2]
+        angles = [math.degrees(math.atan2(y2 - y1, x2 - x1)) for line in lines for x1, y1, x2, y2 in line]
+        median_angle = np.median(angles)
+
+        if abs(median_angle) < 1:
+            return pil_img
+
+        (h, w) = img.shape[:2]
         center = (w // 2, h // 2)
-        M = cv2.getRotationMatrix2D(center, best_angle, 1.0)
+        M = cv2.getRotationMatrix2D(center, median_angle, 1.0)
         rotated = cv2.warpAffine(np.array(pil_img), M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-        
-        print("Deskew correction applied.")
         return Image.fromarray(rotated)
     except Exception as e:
         print(f"Error during image deskewing: {e}")
@@ -332,13 +226,11 @@ def doctr_segment_lines(pil_img):
 def run_english_pipeline(pil_img):
     """Full English OCR pipeline."""
     # 1. Preprocessing
-    corrected_img = correct_perspective(pil_img)
-    deskewed_img = deskew_image(corrected_img)
-    # Use one image for detection (lines removed) and another for recognition (cleaner)
-    processed_img_for_detection = remove_horizontal_lines(deskewed_img)
+    deskewed_img = deskew_image(pil_img)
+    processed_img = remove_horizontal_lines(deskewed_img)
     
     # 2. Line Detection
-    line_boxes = doctr_segment_lines(processed_img_for_detection)
+    line_boxes = doctr_segment_lines(processed_img)
     if not line_boxes:
         return [], pil_img
 
@@ -347,14 +239,14 @@ def run_english_pipeline(pil_img):
     vis_img = deskewed_img.copy().convert("RGB")
     draw = ImageDraw.Draw(vis_img)
     try:
-        font = ImageFont.truetype("arial.ttf", 15)
+        font = ImageFont.truetype(FONT_PATH, 15)
     except IOError:
+        print(f"Could not load font {FONT_PATH}, using default font.")
         font = ImageFont.load_default()
 
     for i, box in enumerate(line_boxes):
         x_min, y_min, x_max, y_max = box
-        # IMPORTANT: Crop from the deskewed image, not the one with lines removed
-        crop = deskewed_img.crop((x_min, y_min, x_max, y_max))
+        crop = processed_img.crop((x_min, y_min, x_max, y_max))
         
         if np.array(crop).std() < 10:
             continue
@@ -366,7 +258,7 @@ def run_english_pipeline(pil_img):
         else:
             processor, model = printed_processor, printed_model
         
-        pixel_values = processor(images=crop.convert("RGB"), return_tensors="pt").pixel_values
+        pixel_values = processor(images=crop.convert("RGB"), return_tensors="pt").pixel_values.to(DEVICE)
         generated_ids = model.generate(pixel_values)
         text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
         
@@ -387,13 +279,11 @@ def run_english_pipeline(pil_img):
 def run_vietnamese_pipeline(pil_img):
     """Full Vietnamese OCR pipeline."""
     # 1. Preprocessing
-    corrected_img = correct_perspective(pil_img)
-    deskewed_img = deskew_image(corrected_img)
-    # Use one image for detection (lines removed) and another for recognition (cleaner)
-    processed_img_for_detection = remove_horizontal_lines(deskewed_img)
+    deskewed_img = deskew_image(pil_img)
+    processed_img = remove_horizontal_lines(deskewed_img)
     
     # 2. Line Detection
-    line_boxes = doctr_segment_lines(processed_img_for_detection)
+    line_boxes = doctr_segment_lines(processed_img)
     if not line_boxes:
         return [], pil_img
 
@@ -401,15 +291,10 @@ def run_vietnamese_pipeline(pil_img):
     ocr_results = []
     vis_img = deskewed_img.copy().convert("RGB")
     draw = ImageDraw.Draw(vis_img)
-    try:
-        font = ImageFont.truetype("arial.ttf", 15)
-    except IOError:
-        font = ImageFont.load_default()
 
     for i, box in enumerate(line_boxes):
         x_min, y_min, x_max, y_max = box
-        # IMPORTANT: Crop from the deskewed image, not the one with lines removed
-        crop = deskewed_img.crop((x_min, y_min, x_max, y_max))
+        crop = processed_img.crop((x_min, y_min, x_max, y_max))
         
         if np.array(crop).std() < 10:
             continue
@@ -423,7 +308,7 @@ def run_vietnamese_pipeline(pil_img):
         
         draw.rectangle(box, outline="orange", width=2)
         text_position = (box[0], box[1] - 15 if box[1] > 15 else box[1])
-        draw.text(text_position, text, fill="orange", font=font)
+        draw.text(text_position, text, fill="orange")
         
     return ocr_results, vis_img
 
@@ -437,6 +322,27 @@ def encode_image_to_base64(pil_img):
 def health_check():
     return jsonify({'status': 'Flask backend is running.'})
 
+@app.route('/upload', methods=['POST'])
+def upload_image():
+    if 'image' not in request.files:
+        return jsonify({'error': 'No image part'}), 400
+    file = request.files['image']
+    if file.filename == '':
+        return jsonify({'error': 'No selected file'}), 400
+    filename = secure_filename(file.filename)
+    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+    file.save(filepath)
+    # Get user_id from form
+    user_id = request.form.get('user_id')
+    if not user_id:
+        return jsonify({'error': 'No user_id provided'}), 400
+    # Store filepath in MySQL
+    cur = mysql.connection.cursor()
+    cur.execute("INSERT INTO images (user_id, image_path) VALUES (%s, %s)", (user_id, filepath))
+    mysql.connection.commit()
+    cur.close()
+    return jsonify({'message': 'Image uploaded successfully', 'path': filepath}), 201
+
 @app.route('/classify', methods=['POST'])
 def classify_blocks():
     if 'image' not in request.files:
@@ -445,31 +351,17 @@ def classify_blocks():
     if file.filename == '':
         return jsonify({'error': 'No selected file'}), 400
     
-    user_id = request.form.get('user_id')
-    if not user_id:
-        return jsonify({'error': 'No user_id provided'}), 400
-
-    cur = None  # Initialize cur to None
     try:
-        # --- Save the file and record it in the database ---
-        filename = secure_filename(file.filename)
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        file.save(filepath)
-
-        cur = mysql.connection.cursor()
-        cur.execute("INSERT INTO images (user_id, image_path) VALUES (%s, %s)", (user_id, filepath))
-        image_id = cur.lastrowid
-        
-        # --- Process the image for OCR ---
-        # Re-read the file from the beginning of the stream for processing
-        file.seek(0)
-        in_memory_file = io.BytesIO(file.read())
+        in_memory_file = io.BytesIO()
+        file.save(in_memory_file)
         data = np.frombuffer(in_memory_file.getvalue(), dtype=np.uint8)
         img_cv = cv2.imdecode(data, cv2.IMREAD_COLOR)
         if img_cv is None:
-            raise ValueError("Invalid image file, could not be decoded by OpenCV.")
+            return jsonify({'error': 'Invalid image file'}), 400
         
+        # Convert to PIL Image for pipelines
         pil_img = Image.fromarray(cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB))
+
         language = request.form.get('language', 'eng').lower()
 
         if language in ['vie', 'vi', 'vietnamese']:
@@ -479,26 +371,27 @@ def classify_blocks():
             print("Running English OCR pipeline...")
             ocr_results, vis_img = run_english_pipeline(pil_img)
 
+        # Encode visualization image to base64
         vis_base64 = encode_image_to_base64(vis_img)
 
-        # --- Store OCR results in DB ---
-        if image_id:
+        # Store results in DB
+        filename = secure_filename(file.filename)
+        cur = mysql.connection.cursor()
+        cur.execute("SELECT id FROM images WHERE image_path LIKE %s ORDER BY uploaded_at DESC LIMIT 1", (f"%{filename}",))
+        row = cur.fetchone()
+        if row:
+            image_id = row[0]
             recognized_text = "\n".join([block['text'] for block in ocr_results])
             cur.execute("INSERT INTO results (image_id, recognized_text) VALUES (%s, %s)", (image_id, recognized_text))
-        
-        mysql.connection.commit()
+            mysql.connection.commit()
+        cur.close()
 
         print(f"Pipeline finished. Found {len(ocr_results)} text blocks.")
         return jsonify({'results': ocr_results, 'visualization': vis_base64}), 200
 
     except Exception as e:
-        if cur:
-            mysql.connection.rollback()
         print(f"Error in /classify endpoint: {e}")
         return jsonify({'error': f'An unexpected error occurred: {str(e)}'}), 500
-    finally:
-        if cur:
-            cur.close()
 
 @app.route('/register', methods=['POST'])
 def register():
@@ -538,4 +431,4 @@ def login():
     return jsonify({'message': 'Login successful', 'user_id': user_id}), 200
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0')
+    app.run(debug=True, host='0.0.0.0') 

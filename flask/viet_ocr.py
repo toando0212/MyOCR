@@ -175,6 +175,91 @@ def remove_horizontal_lines(pil_img):
         logger.error(f"Error in horizontal line removal: {str(e)}")
         raise
 
+def correct_perspective(pil_img: Image.Image) -> Image.Image:
+    """
+    Corrects perspective distortion in an image of a document.
+    Finds the largest quadrilateral in the image and warps it to a top-down view.
+    This version includes a check to ensure the detected contour is large enough to be the document.
+    """
+    try:
+        img = np.array(pil_img.convert("RGB"))
+        orig = img.copy()
+        
+        # Downscale for faster processing, preserving aspect ratio
+        proc_height = 500.0
+        if img.shape[0] <= proc_height:
+             ratio = 1.0
+             proc_img = img.copy()
+        else:
+             ratio = img.shape[0] / proc_height
+             proc_img = cv2.resize(img, (int(img.shape[1] / ratio), int(proc_height)))
+
+        # Edge detection
+        gray = cv2.cvtColor(proc_img, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+        edged = cv2.Canny(gray, 75, 200)
+
+        # Find contours
+        contours, _ = cv2.findContours(edged.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:5]
+
+        screenCnt = None
+        img_area = proc_img.shape[0] * proc_img.shape[1]
+
+        for c in contours:
+            peri = cv2.arcLength(c, True)
+            approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+            
+            if len(approx) == 4:
+                if cv2.contourArea(approx) > img_area * 0.20: # Must be at least 20% of the image
+                    screenCnt = approx
+                    break
+                else:
+                    logger.info(f"Found a 4-point contour, but its area is too small. Skipping it.")
+        
+        if screenCnt is None:
+            logger.warning("Could not find a suitable document contour. Skipping perspective correction.")
+            return pil_img
+        
+        logger.info("Found document contour, applying perspective correction.")
+
+        # Order the points for the perspective transform
+        pts = screenCnt.reshape(4, 2) * ratio
+        rect = np.zeros((4, 2), dtype="float32")
+        s = pts.sum(axis=1)
+        rect[0] = pts[np.argmin(s)] # Top-left
+        rect[2] = pts[np.argmax(s)] # Bottom-right
+        diff = np.diff(pts, axis=1)
+        rect[1] = pts[np.argmin(diff)] # Top-right
+        rect[3] = pts[np.argmax(diff)] # Bottom-left
+        
+        (tl, tr, br, bl) = rect
+
+        widthA = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
+        widthB = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
+        maxWidth = max(int(widthA), int(widthB))
+
+        heightA = np.sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
+        heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
+        maxHeight = max(int(heightA), int(heightB))
+
+        if maxWidth <= 0 or maxHeight <= 0:
+            logger.warning("Calculated invalid dimensions for warped image. Skipping perspective correction.")
+            return pil_img
+
+        dst = np.array([
+            [0, 0],
+            [maxWidth - 1, 0],
+            [maxWidth - 1, maxHeight - 1],
+            [0, maxHeight - 1]], dtype="float32")
+
+        M = cv2.getPerspectiveTransform(rect, dst)
+        warped = cv2.warpPerspective(orig, M, (maxWidth, maxHeight))
+        return Image.fromarray(warped)
+    except Exception as e:
+        logger.error(f"Error during perspective correction: {e}", exc_info=True)
+        return pil_img
+
 def deskew_image(pil_img: Image.Image) -> Image.Image:
     """Detects the skew angle of the text in the image and rotates it to be straight."""
     try:
@@ -216,8 +301,11 @@ def ocr_pipeline(pil_img):
             logger.warning("Input image is None, stopping pipeline.")
             return "Please upload an image.", None, None, None
             
+        logger.info("Correcting perspective...")
+        corrected_img = correct_perspective(pil_img)
+
         logger.info("Deskewing image...")
-        deskewed_img = deskew_image(pil_img)
+        deskewed_img = deskew_image(corrected_img)
         
         logger.info("Removing horizontal lines...")
         processed_img_for_detection = remove_horizontal_lines(deskewed_img)
@@ -230,7 +318,7 @@ def ocr_pipeline(pil_img):
             return "No lines detected.", processed_img_for_detection, deskewed_img.copy().convert("RGB"), None
 
         logger.info("Recognizing text with VietOCR...")
-        recognized_lines = recognize_lines_with_vietocr(processed_img_for_detection, line_boxes)
+        recognized_lines = recognize_lines_with_vietocr(deskewed_img, line_boxes)
         
         logger.info("Creating visualization...")
         line_img = deskewed_img.copy().convert("RGB")

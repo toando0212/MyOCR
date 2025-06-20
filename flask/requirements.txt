@@ -1,0 +1,22 @@
+# Core Flask
+flask==3.0.3
+flask-cors==4.0.1
+flask-mysqldb==1.0.1
+Werkzeug==3.0.3
+MarkupSafe==2.1.3
+gunicorn==21.2.0
+
+# ML & OCR Libraries
+# NOTE: The torch version is based on your local CPU build.
+# On the server, you should install the GPU version separately first.
+torch==2.7.1
+transformers==4.52.4
+python-doctr[torch]==0.11.0
+vietocr==0.3.13
+opencv-python==4.11.0.86
+
+# Data & Model Handling
+numpy==1.26.4
+scikit-learn==1.2.2
+joblib==1.3.2
+Pillow==10.2.0 

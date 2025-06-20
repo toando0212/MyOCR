@@ -80,7 +80,7 @@ public class LoginActivity extends AppCompatActivity {
             String username = params[0];
             String password = params[1];
             try {
-                URL url = new URL("http://192.168.1.229:5000/register"); // Use 10.0.2.2 for Android emulator
+                URL url = new URL("https://3e8f-42-114-227-240.ngrok-free.app/register");
                 HttpURLConnection conn = (HttpURLConnection) url.openConnection();
                 conn.setRequestMethod("POST");
                 conn.setRequestProperty("Content-Type", "application/json; utf-8");
@@ -139,7 +139,7 @@ public class LoginActivity extends AppCompatActivity {
             String username = params[0];
             String password = params[1];
             try {
-                URL url = new URL("http://192.168.1.229:5000/login");
+                URL url = new URL("https://3e8f-42-114-227-240.ngrok-free.app/login");
                 HttpURLConnection conn = (HttpURLConnection) url.openConnection();
                 conn.setRequestMethod("POST");
                 conn.setRequestProperty("Content-Type", "application/json; utf-8");
