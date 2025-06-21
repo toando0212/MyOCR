@@ -85,78 +85,111 @@ def doctr_segment_lines(pil_img):
         # Sort words by their vertical position, then horizontal
         words.sort(key=lambda w: (w[1], w[0]))
 
-        lines = []
+        lines_with_words = []
         if not words:
             return []
 
         # Heuristic-based line reconstruction
-        current_line = [words[0]]
+        current_line_words = [words[0]]
         for box in words[1:]:
-            last_box = current_line[-1]
+            last_box = current_line_words[-1]
             last_box_y_center = (last_box[1] + last_box[3]) / 2
             current_box_y_center = (box[1] + box[3]) / 2
             last_box_height = last_box[3] - last_box[1]
 
             if abs(current_box_y_center - last_box_y_center) < last_box_height * 0.7:
-                current_line.append(box)
+                current_line_words.append(box)
             else:
-                min_x = min(b[0] for b in current_line)
-                min_y = min(b[1] for b in current_line)
-                max_x = max(b[2] for b in current_line)
-                max_y = max(b[3] for b in current_line)
-                lines.append((min_x, min_y, max_x, max_y))
-                current_line = [box]
+                min_x = min(b[0] for b in current_line_words)
+                min_y = min(b[1] for b in current_line_words)
+                max_x = max(b[2] for b in current_line_words)
+                max_y = max(b[3] for b in current_line_words)
+                lines_with_words.append(((min_x, min_y, max_x, max_y), sorted(current_line_words, key=lambda b: b[0])))
+                current_line_words = [box]
         
-        if current_line:
-            min_x = min(b[0] for b in current_line)
-            min_y = min(b[1] for b in current_line)
-            max_x = max(b[2] for b in current_line)
-            max_y = max(b[3] for b in current_line)
-            lines.append((min_x, min_y, max_x, max_y))
+        if current_line_words:
+            min_x = min(b[0] for b in current_line_words)
+            min_y = min(b[1] for b in current_line_words)
+            max_x = max(b[2] for b in current_line_words)
+            max_y = max(b[3] for b in current_line_words)
+            lines_with_words.append(((min_x, min_y, max_x, max_y), sorted(current_line_words, key=lambda b: b[0])))
 
-        line_boxes = lines
-        logger.info(f"Reconstructed {len(line_boxes)} lines from {len(words)} words.")
+        logger.info(f"Reconstructed {len(lines_with_words)} lines from {len(words)} words.")
         
         try:
             os.remove(temp_path)
         except Exception as e:
             logger.warning(f"Failed to remove temporary file: {str(e)}")
             
-        return line_boxes
+        return lines_with_words
     except Exception as e:
         logger.error(f"Error in line segmentation: {str(e)}", exc_info=True)
         raise
 
 @torch.no_grad()
-def recognize_lines_with_vietocr(pil_img, line_boxes):
+def recognize_lines_with_vietocr(pil_img, lines_with_words):
     logger.info("Starting text recognition with VietOCR...")
     try:
         recognized_lines = []
-        logger.info(f"Line boxes: {line_boxes}")
-        for i, box in enumerate(line_boxes):
-            x_min, y_min, x_max, y_max = box
-            crop = pil_img.crop((x_min, y_min, x_max, y_max))
+        
+        def recognize_chunk(crop_img):
+            if crop_img.width == 0 or crop_img.height == 0:
+                return ""
+            if np.array(crop_img).std() < 10:
+                return ""
+            return vietocr_predictor.predict(crop_img)
+
+        logger.info(f"Processing {len(lines_with_words)} lines.")
+        for i, (line_box, word_boxes) in enumerate(lines_with_words):
+            line_crop = pil_img.crop(line_box)
             
-            if np.array(crop).std() < 10:
-                logger.debug(f"Skipping line {i+1} due to low contrast")
-                continue
+            line_width = line_box[2] - line_box[0]
+            line_height = line_box[3] - line_box[1]
+            aspect_ratio = line_width / line_height if line_height > 0 else 0
+            
+            logger.debug(f"Line {i+1} box: {line_box}, aspect ratio: {aspect_ratio:.2f}")
+
+            # "Divide and conquer" for long lines
+            if aspect_ratio > 15 and len(word_boxes) > 1:
+                logger.info(f"Line {i+1} is long (ratio: {aspect_ratio:.2f}). Processing in chunks.")
                 
-            logger.debug(f"Processing line {i+1} with box: {box}")
-            
-            # Recognize text using VietOCR
-            text = vietocr_predictor.predict(crop)
-            
-            if len(text) < 2:
-                logger.debug(f"Skipping line {i+1} due to short text: '{text}'")
-                continue
-                
-            recognized_lines.append(text)
-            logger.debug(f"Recognized line {i+1}: {text}")
+                line_text_parts = []
+                current_chunk_words = []
+                for idx, word_box in enumerate(word_boxes):
+                    current_chunk_words.append(word_box)
+                    
+                    chunk_x_min = min(b[0] for b in current_chunk_words)
+                    chunk_y_min = min(b[1] for b in current_chunk_words)
+                    chunk_x_max = max(b[2] for b in current_chunk_words)
+                    chunk_y_max = max(b[3] for b in current_chunk_words)
+                    
+                    chunk_width = chunk_x_max - chunk_x_min
+                    chunk_height = chunk_y_max - chunk_y_min
+                    chunk_aspect_ratio = chunk_width / chunk_height if chunk_height > 0 else 0
+
+                    if chunk_aspect_ratio > 8 or idx == len(word_boxes) - 1:
+                        chunk_crop = pil_img.crop((chunk_x_min, chunk_y_min, chunk_x_max, chunk_y_max))
+                        chunk_text = recognize_chunk(chunk_crop)
+                        if chunk_text:
+                            line_text_parts.append(chunk_text)
+                        current_chunk_words = []
+
+                full_line_text = " ".join(line_text_parts)
+                recognized_lines.append(full_line_text)
+                logger.debug(f"Reconstructed line {i+1}: {full_line_text}")
+
+            else: # Process as a single block
+                text = recognize_chunk(line_crop)
+                if text:
+                    recognized_lines.append(text)
+                    logger.debug(f"Recognized line {i+1}: {text}")
+                else:
+                    logger.debug(f"Skipping line {i+1} due to empty recognition result.")
             
         logger.info(f"Successfully recognized {len(recognized_lines)} lines")
         return recognized_lines
     except Exception as e:
-        logger.error(f"Error in text recognition: {str(e)}")
+        logger.error(f"Error in text recognition: {str(e)}", exc_info=True)
         raise
 
 def remove_horizontal_lines(pil_img):
@@ -311,14 +344,17 @@ def ocr_pipeline(pil_img):
         processed_img_for_detection = remove_horizontal_lines(deskewed_img)
         
         logger.info("Detecting lines...")
-        line_boxes = doctr_segment_lines(processed_img_for_detection)
+        lines_with_words = doctr_segment_lines(processed_img_for_detection)
         
-        if not line_boxes:
+        if not lines_with_words:
             logger.warning("No lines were detected by DocTR.")
             return "No lines detected.", processed_img_for_detection, deskewed_img.copy().convert("RGB"), None
 
+        # Extract just the line boxes for visualization
+        line_boxes = [item[0] for item in lines_with_words]
+
         logger.info("Recognizing text with VietOCR...")
-        recognized_lines = recognize_lines_with_vietocr(deskewed_img, line_boxes)
+        recognized_lines = recognize_lines_with_vietocr(deskewed_img, lines_with_words)
         
         logger.info("Creating visualization...")
         line_img = deskewed_img.copy().convert("RGB")

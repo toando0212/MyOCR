@@ -1,14 +1,9 @@
-# List of known DocTR architectures
-architectures = [
-    "db_resnet50",
-    "db_resnet34",
-    "db_mobilenet_v3_large",
-    "db_mobilenet_v3_small",
-    "linknet_resnet18",
-    "linknet_resnet34",
-    "linknet_resnet50"
-]
+from doctr.models import detection, recognition
 
-print("Known DocTR architectures:")
-for arch in architectures:
-    print(f"- {arch}") 
+# Liệt kê các mô hình phát hiện văn bản
+detection_models = [name for name in dir(detection) if not name.startswith("_")]
+print("Các mô hình phát hiện văn bản có sẵn:", detection_models)
+
+# Liệt kê các mô hình nhận dạng văn bản
+recognition_models = [name for name in dir(recognition) if not name.startswith("_")]
+print("Các mô hình nhận dạng văn bản có sẵn:", recognition_models)

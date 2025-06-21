@@ -66,7 +66,7 @@ def evaluate_pipeline():
     # --- Configuration ---
     IMAGE_DIR = 'D:/MyOCR/InkData_paragraph'
     CSV_PATH = 'D:/MyOCR/InkData_paragraph/InkData_paragraph.csv'
-    NUM_IMAGES_TO_TEST = 10
+    NUM_IMAGES_TO_TEST = 20
 
     # --- Load Ground Truth Data ---
     logging.info(f"Loading ground truth data from {CSV_PATH}")
