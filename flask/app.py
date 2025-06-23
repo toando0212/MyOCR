@@ -9,6 +9,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from PIL import Image, ImageOps
 import io
 import base64
+import argparse
 
 # Import the OCR pipelines
 # These files now contain all the model loading and processing logic.
@@ -285,4 +286,7 @@ def delete_history_session():
             cur.close()
 
 if __name__ == '__main__':
-    app.run(debug=True, host='127.0.0.1')
+    parser = argparse.ArgumentParser(description='Run Flask app on a specified port')
+    parser.add_argument('--port', type=int, default=5000, help='Port to run the Flask app on')
+    args = parser.parse_args()
+    app.run(debug=True, port=args.port)

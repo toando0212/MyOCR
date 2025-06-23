@@ -56,9 +56,20 @@ import android.content.SharedPreferences;
 import android.widget.LinearLayout;
 import android.util.Base64;
 import android.util.Log;
+import android.os.Environment;
+
+import com.itextpdf.text.Document;
+import com.itextpdf.text.Font;
+import com.itextpdf.text.Paragraph;
+import com.itextpdf.text.pdf.BaseFont;
+import com.itextpdf.text.pdf.PdfWriter;
+import org.apache.poi.xwpf.usermodel.XWPFDocument;
+import org.apache.poi.xwpf.usermodel.XWPFParagraph;
+import org.apache.poi.xwpf.usermodel.XWPFRun;
 
 public class MainActivity extends AppCompatActivity implements ImageAdapter.OnImageClickListener, HistoryAdapter.OnHistorySessionInteractionListener {
     private static final int REQUEST_CAMERA_PERMISSION = 100;
+    private static final int REQUEST_WRITE_STORAGE_PERMISSION = 102; // For export
     private RecyclerView imageRecyclerView;
     private ImageAdapter imageAdapter;
     private List<Uri> imageUris = new ArrayList<>();
@@ -317,6 +328,12 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
             } else {
                 Toast.makeText(this, "Permission denied to read external storage", Toast.LENGTH_SHORT).show();
             }
+        } else if (requestCode == REQUEST_WRITE_STORAGE_PERMISSION) {
+            if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                Toast.makeText(this, "Storage permission granted. Please try exporting again.", Toast.LENGTH_SHORT).show();
+            } else {
+                Toast.makeText(this, "Storage permission denied. Cannot export file.", Toast.LENGTH_SHORT).show();
+            }
         }
     }
 
@@ -363,7 +380,123 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
     }
 
     private void exportRecognizedText() {
-        Toast.makeText(this, R.string.export_coming_soon, Toast.LENGTH_SHORT).show();
+        if (ocrResultList.isEmpty() || getCombinedOcrText().isEmpty()) {
+            Toast.makeText(this, "Không có văn bản để xuất.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        final String[] formats = {"PDF", "DOCX"};
+        AlertDialog.Builder builder = new AlertDialog.Builder(this);
+        builder.setTitle("Chọn định dạng xuất");
+        builder.setItems(formats, (dialog, which) -> {
+            if (which == 0) {
+                exportToFile("pdf");
+            } else {
+                exportToFile("docx");
+            }
+        });
+        builder.show();
+    }
+
+    private void exportToFile(String format) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+                ActivityCompat.requestPermissions(this, new String[]{Manifest.permission.WRITE_EXTERNAL_STORAGE}, REQUEST_WRITE_STORAGE_PERMISSION);
+                return;
+            }
+        }
+
+        if ("pdf".equals(format)) {
+            createPdf();
+        } else if ("docx".equals(format)) {
+            createDocx();
+        }
+    }
+
+    private String getCombinedOcrText() {
+        StringBuilder fullText = new StringBuilder();
+        for (OcrResult result : ocrResultList) {
+            if (result.getRecognizedText() != null && !result.getRecognizedText().isEmpty() &&
+                    !result.getRecognizedText().equals("Queued...") && !result.getRecognizedText().equals("Đang xử lý...") &&
+                    !result.getRecognizedText().contains("Error") && !result.getRecognizedText().contains("Lỗi")) {
+                fullText.append(result.getRecognizedText()).append("\n\n---\n\n");
+            }
+        }
+        return fullText.toString();
+    }
+
+    private void createPdf() {
+        String ocrText = getCombinedOcrText();
+        String fileName = "OCR_Result_" + System.currentTimeMillis() + ".pdf";
+
+        ContentValues contentValues = new ContentValues();
+        contentValues.put(MediaStore.MediaColumns.DISPLAY_NAME, fileName);
+        contentValues.put(MediaStore.MediaColumns.MIME_TYPE, "application/pdf");
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            contentValues.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
+        }
+
+        Uri uri = getContentResolver().insert(Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
+                ? MediaStore.Downloads.EXTERNAL_CONTENT_URI
+                : MediaStore.Files.getContentUri("external"), contentValues);
+
+        if (uri != null) {
+            try (OutputStream outputStream = getContentResolver().openOutputStream(uri)) {
+                Document document = new Document();
+                PdfWriter.getInstance(document, outputStream);
+                document.open();
+
+                try {
+                    BaseFont baseFont = BaseFont.createFont("assets/fonts/Roboto_Condensed-BoldItalic.ttf", BaseFont.IDENTITY_H, BaseFont.EMBEDDED);
+                    Font vietnameseFont = new Font(baseFont, 12);
+                    document.add(new Paragraph(ocrText, vietnameseFont));
+                } catch (Exception e) {
+                    Log.e("PDF_FONT", "Lỗi tải font, sử dụng font mặc định.", e);
+                    document.add(new Paragraph(ocrText));
+                }
+                
+                document.close();
+                Toast.makeText(this, "Đã lưu PDF vào thư mục Downloads.", Toast.LENGTH_LONG).show();
+            } catch (Exception e) {
+                Log.e("ExportPDF", "Không thể tạo tệp PDF", e);
+                Toast.makeText(this, "Lỗi khi lưu tệp PDF.", Toast.LENGTH_SHORT).show();
+            }
+        }
+    }
+
+    private void createDocx() {
+        String ocrText = getCombinedOcrText();
+        String fileName = "OCR_Result_" + System.currentTimeMillis() + ".docx";
+
+        ContentValues contentValues = new ContentValues();
+        contentValues.put(MediaStore.MediaColumns.DISPLAY_NAME, fileName);
+        contentValues.put(MediaStore.MediaColumns.MIME_TYPE, "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            contentValues.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
+        }
+
+        Uri uri = getContentResolver().insert(Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
+                ? MediaStore.Downloads.EXTERNAL_CONTENT_URI
+                : MediaStore.Files.getContentUri("external"), contentValues);
+
+        if (uri != null) {
+            try (OutputStream outputStream = getContentResolver().openOutputStream(uri);
+                 XWPFDocument document = new XWPFDocument()) {
+
+                String[] lines = ocrText.split("\n");
+                for (String line : lines) {
+                    XWPFParagraph paragraph = document.createParagraph();
+                    XWPFRun run = paragraph.createRun();
+                    run.setText(line);
+                }
+
+                document.write(outputStream);
+                Toast.makeText(this, "Đã lưu DOCX vào thư mục Downloads.", Toast.LENGTH_LONG).show();
+            } catch (Exception e) {
+                Log.e("ExportDOCX", "Không thể tạo tệp DOCX", e);
+                Toast.makeText(this, "Lỗi khi lưu tệp DOCX.", Toast.LENGTH_SHORT).show();
+            }
+        }
     }
 
     private void performOcrForImage(Uri imageUri, final int position, int userId) {
