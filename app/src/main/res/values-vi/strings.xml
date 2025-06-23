@@ -20,7 +20,7 @@
     <string name="please_select_image">Vui lòng chọn ảnh trước.</string>
     <string name="no_text_recognized">Không nhận diện được văn bản.</string>
     <string name="export_file">Xuất file</string>
-    <string name="export_coming_soon">Chức năng xuất ra PDF/DOCX sẽ được bổ sung sau.</string>
+    <string name="export_coming_soon">Tính năng xuất file sắp ra mắt!</string>
     <string name="ok">OK</string>
     <string name="history_selected">Đã chọn lịch sử</string>
     <string name="permission_denied">Bạn đã từ chối quyền truy cập bộ nhớ</string>
@@ -47,7 +47,8 @@
     <string name="yes">Có</string>
     <string name="no">Không</string>
     <string name="stop_ocr">Dừng OCR</string>
-    <string name="stop_ocr_title">Dừng xử lý</string>
+    <string name="stop_ocr_title">Dừng OCR</string>
     <string name="stop_ocr_confirmation">Bạn có chắc muốn dừng quá trình OCR không?</string>
-    <string name="ocr_stopped_message">Đã dừng quá trình OCR.</string>
+    <string name="ocr_stopped_message">Quá trình OCR đã bị người dùng dừng lại.</string>
+    <string name="long_press_to_delete">Nhấn giữ vào ảnh để xoá</string>
 </resources>

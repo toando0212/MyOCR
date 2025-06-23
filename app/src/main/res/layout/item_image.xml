@@ -12,14 +12,4 @@
         
         android:contentDescription="@string/add" />
 
-    <ImageButton
-        android:id="@+id/btnDelete"
-        android:layout_width="24dp"
-        android:layout_height="24dp"
-        android:layout_gravity="top|end"
-        android:background="@android:color/transparent"
-        android:src="@android:drawable/ic_menu_close_clear_cancel"
-        android:contentDescription="Delete"
-        android:tint="@android:color/white"
-        android:padding="2dp"/>
 </FrameLayout> 

@@ -97,4 +97,5 @@
     <string name="stop_ocr_title">Stop Process</string>
     <string name="stop_ocr_confirmation">Are you sure you want to stop the OCR process?</string>
     <string name="ocr_stopped_message">OCR process stopped.</string>
+    <string name="long_press_to_delete">Long-press on an image to delete</string>
 </resources>

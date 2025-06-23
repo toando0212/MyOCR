@@ -21,6 +21,7 @@ public class ImageAdapter extends RecyclerView.Adapter<ImageAdapter.ViewHolder> 
 
     public interface OnImageClickListener {
         void onImageClick(Uri imageUri);
+        void onImageLongClick(Uri imageUri);
     }
 
     public ImageAdapter(Context context, List<Uri> imageUris, OnImageClickListener listener) {
@@ -47,21 +48,11 @@ public class ImageAdapter extends RecyclerView.Adapter<ImageAdapter.ViewHolder> 
             }
         });
 
-        holder.btnDelete.setOnClickListener(v -> {
-            new AlertDialog.Builder(context)
-                    .setTitle(R.string.delete_image_title)
-                    .setMessage(R.string.delete_image_confirmation)
-                    .setPositiveButton(R.string.delete, (dialog, which) -> {
-                        // User clicked "Delete"
-                        int currentPosition = holder.getAdapterPosition();
-                        if (currentPosition != RecyclerView.NO_POSITION) {
-                            imageUris.remove(currentPosition);
-                            notifyItemRemoved(currentPosition);
-                            notifyItemRangeChanged(currentPosition, imageUris.size());
-                        }
-                    })
-                    .setNegativeButton(R.string.cancel, null)
-                    .show();
+        holder.imageView.setOnLongClickListener(v -> {
+            if (listener != null) {
+                listener.onImageLongClick(uri);
+            }
+            return true;
         });
     }
 
@@ -72,12 +63,10 @@ public class ImageAdapter extends RecyclerView.Adapter<ImageAdapter.ViewHolder> 
 
     public static class ViewHolder extends RecyclerView.ViewHolder {
         ImageView imageView;
-        ImageButton btnDelete;
 
         public ViewHolder(@NonNull View itemView) {
             super(itemView);
             imageView = itemView.findViewById(R.id.imageView);
-            btnDelete = itemView.findViewById(R.id.btnDelete);
         }
     }
 

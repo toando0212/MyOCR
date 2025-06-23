@@ -45,6 +45,7 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import okhttp3.*;
@@ -68,6 +69,7 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
     private RadioButton radioVietnamese, radioEnglish;
     private RadioGroup languageRadioGroup;
     private TextView tvSelectLanguage;
+    private TextView tvDeleteInstruction;
 
     private RecyclerView ocrResultRecyclerView;
     private OcrResultAdapter ocrResultAdapter;
@@ -92,7 +94,11 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
 
     private boolean isLoggedIn = false;
     private int userId = -1;
-    private final OkHttpClient client = new OkHttpClient();
+    private final OkHttpClient client = new OkHttpClient.Builder()
+            .connectTimeout(60, TimeUnit.SECONDS)
+            .writeTimeout(60, TimeUnit.SECONDS)
+            .readTimeout(60, TimeUnit.SECONDS)
+            .build();
     private static final String BASE_URL = "https://7c2c-2405-4803-f801-12a0-1883-6ffe-89a4-5660.ngrok-free.app"; // IMPORTANT: Use your actual server URL
 
     @Override
@@ -121,6 +127,7 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
         languageRadioGroup = findViewById(R.id.languageRadioGroup);
         progressBar = findViewById(R.id.progressBar);
         fab = findViewById(R.id.fab);
+        tvDeleteInstruction = findViewById(R.id.tv_delete_instruction);
 
         // Setup for the selected images RecyclerView
         imageAdapter = new ImageAdapter(this, imageUris, this);
@@ -371,9 +378,18 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
             return;
         }
 
+        // Dynamically determine the MIME type from the content URI to avoid format errors.
+        String mimeType = getContentResolver().getType(imageUri);
+        if (mimeType == null) {
+            // Fallback for safety, though it should ideally not be null for gallery/camera images
+            mimeType = "image/jpeg";
+            Log.w("OCR_MIME_TYPE", "MIME type was null for URI: " + imageUri + ". Defaulting to image/jpeg.");
+        }
+        MediaType mediaType = MediaType.parse(mimeType);
+
         RequestBody requestBody = new MultipartBody.Builder()
                 .setType(MultipartBody.FORM)
-                .addFormDataPart("image", "image.jpg", RequestBody.create(imageData, MediaType.parse("image/jpeg")))
+                .addFormDataPart("image", "image.jpg", RequestBody.create(imageData, mediaType))
                 .addFormDataPart("language", radioVietnamese.isChecked() ? "vie" : "eng")
                 .addFormDataPart("user_id", String.valueOf(userId))
                 .build();
@@ -461,6 +477,7 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
         tvSelectLanguage.setText(getString(R.string.select_document_language));
         radioVietnamese.setText(getString(R.string.vietnamese));
         radioEnglish.setText(getString(R.string.english));
+        tvDeleteInstruction.setText(getString(R.string.long_press_to_delete));
     }
 
     private void setupNavigationDrawer() {
@@ -567,20 +584,17 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
     @Override
     public void onImageClick(Uri imageUri) {
         // This is for the top image list, not history
-        // Let's implement a confirmation dialog here
-        new AlertDialog.Builder(this)
-                .setTitle(R.string.delete_image_title)
-                .setMessage(R.string.delete_image_confirmation)
-                .setPositiveButton(R.string.delete, (dialog, which) -> {
-                    int position = imageUris.indexOf(imageUri);
-                    if (position != -1) {
-                        imageUris.remove(position);
-                        imageAdapter.notifyItemRemoved(position);
-                        imageAdapter.notifyItemRangeChanged(position, imageUris.size());
-                    }
-                })
-                .setNegativeButton(R.string.cancel, null)
-                .show();
+        // OLD: show delete confirmation dialog
+        // NEW: Open image in a viewer
+        Intent intent = new Intent(Intent.ACTION_VIEW);
+        intent.setDataAndType(imageUri, "image/*");
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION); // Important for content URIs
+        try {
+            startActivity(intent);
+        } catch (Exception e) {
+            Toast.makeText(this, "No application can handle this request. Please install a gallery app.", Toast.LENGTH_SHORT).show();
+            e.printStackTrace();
+        }
     }
 
     @Override
@@ -718,5 +732,22 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
             progressBar.setProgress(0);
             currentOcrCall = null;
         }
+    }
+
+    @Override
+    public void onImageLongClick(Uri imageUri) {
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.delete_image_title)
+                .setMessage(R.string.delete_image_confirmation)
+                .setPositiveButton(R.string.delete, (dialog, which) -> {
+                    int position = imageUris.indexOf(imageUri);
+                    if (position != -1) {
+                        imageUris.remove(position);
+                        imageAdapter.notifyItemRemoved(position);
+                        imageAdapter.notifyItemRangeChanged(position, imageUris.size());
+                    }
+                })
+                .setNegativeButton(R.string.cancel, null)
+                .show();
     }
 }

@@ -6,7 +6,7 @@ from werkzeug.utils import secure_filename
 import cv2
 import numpy as np
 from werkzeug.security import generate_password_hash, check_password_hash
-from PIL import Image
+from PIL import Image, ImageOps
 import io
 import base64
 
@@ -61,18 +61,27 @@ def classify_blocks():
 
     cur = None
     try:
-        # --- Save the file and record it in the database ---
+        # --- Read image into memory first for processing ---
+        image_data = file.read()
+        pil_img = Image.open(io.BytesIO(image_data))
+
+        # --- FIX: Apply EXIF orientation correction ---
+        pil_img = ImageOps.exif_transpose(pil_img)
+        
+        # --- Now convert to RGB after orientation is fixed ---
+        pil_img = pil_img.convert("RGB")
+
+        # --- Now, save the original image data to a file for record-keeping ---
         filename = secure_filename(f"{user_id}_{file.filename}")
         filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        file.save(filepath)
+        with open(filepath, 'wb') as f:
+            f.write(image_data)
 
         cur = mysql.connection.cursor()
         cur.execute("INSERT INTO images (user_id, image_path) VALUES (%s, %s)", (user_id, filepath))
         image_id = cur.lastrowid
         
-        # --- Process the image for OCR using imported pipelines ---
-        pil_img = Image.open(filepath).convert("RGB")
-        
+        # --- Process the image for OCR using imported pipelines (pil_img is already loaded) ---
         recognized_text = ""
         vis_img = None
 
