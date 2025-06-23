@@ -14,19 +14,26 @@
         android:fitsSystemWindows="true"
         tools:context=".MainActivity">
 
-        <androidx.appcompat.widget.Toolbar
-            android:id="@+id/toolbar"
+        <com.google.android.material.appbar.AppBarLayout
             android:layout_width="match_parent"
-            android:layout_height="?attr/actionBarSize"
-            android:background="?attr/colorPrimary"
-            app:popupTheme="@style/Theme.AppCompat.Light" />
+            android:layout_height="wrap_content">
+
+            <androidx.appcompat.widget.Toolbar
+                android:id="@+id/toolbar"
+                android:layout_width="match_parent"
+                android:layout_height="?attr/actionBarSize"
+                android:background="?attr/colorPrimary"
+                app:popupTheme="@style/Theme.AppCompat.Light" />
+
+        </com.google.android.material.appbar.AppBarLayout>
 
         <LinearLayout
             android:id="@+id/main_content"
             android:layout_width="match_parent"
             android:layout_height="match_parent"
             android:orientation="vertical"
-            android:padding="16dp">
+            android:padding="16dp"
+            app:layout_behavior="@string/appbar_scrolling_view_behavior">
 
             <androidx.recyclerview.widget.RecyclerView
                 android:id="@+id/imageRecyclerView"
@@ -41,7 +48,17 @@
                 android:id="@+id/btnRunOcr"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:text="Run OCR" />
+                android:text="@string/run_ocr" />
+
+            <Button
+                android:id="@+id/btnStopOcr"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/stop_ocr"
+                android:visibility="gone"
+                style="@style/Widget.AppCompat.Button.Colored"
+                android:backgroundTint="@color/design_default_color_error"
+                />
 
             <ProgressBar
                 android:id="@+id/progressBar"
@@ -50,24 +67,30 @@
                 android:visibility="gone"
                 style="?android:attr/progressBarStyleHorizontal" />
 
-            <TextView
-                android:id="@+id/tvRecognizedText"
+            <androidx.recyclerview.widget.RecyclerView
+                android:id="@+id/ocrResultRecyclerView"
                 android:layout_width="match_parent"
                 android:layout_height="0dp"
                 android:layout_weight="1"
-                android:background="#EEEEEE"
-                android:padding="8dp"
-                android:text=""
-                android:textIsSelectable="true"
-                android:scrollbars="vertical"
-                android:gravity="top|start"
-                android:textSize="16sp" />
+                app:layoutManager="androidx.recyclerview.widget.LinearLayoutManager"
+                android:paddingTop="8dp"
+                android:paddingBottom="8dp"
+                android:clipToPadding="false"/>
 
             <Button
                 android:id="@+id/btnExport"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:text="Xuất ra PDF hoặc DOCX" />
+
+            <TextView
+                android:id="@+id/tvSelectLanguage"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/select_document_language"
+                android:textStyle="bold"
+                android:textSize="16sp"
+                android:layout_marginBottom="4dp" />
 
             <RadioGroup
                 android:id="@+id/languageRadioGroup"
@@ -78,13 +101,13 @@
                     android:id="@+id/radioVietnamese"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:text="Vietnamese"
+                    android:text="@string/vietnamese"
                     android:checked="true"/>
                 <RadioButton
                     android:id="@+id/radioEnglish"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:text="English"/>
+                    android:text="@string/english"/>
             </RadioGroup>
         </LinearLayout>
 
@@ -104,7 +127,73 @@
         android:id="@+id/nav_view"
         android:layout_width="wrap_content"
         android:layout_height="match_parent"
-        android:layout_gravity="start"
-        app:menu="@menu/drawer_menu" />
+        android:layout_gravity="start">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:orientation="vertical">
+
+            <View
+                android:id="@+id/status_bar_spacer"
+                android:layout_width="match_parent"
+                android:layout_height="0dp" />
+
+            <Button
+                android:id="@+id/btn_new_session"
+                style="@style/Widget.MaterialComponents.Button.TextButton.Icon"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/new_ocr_session"
+                android:layout_margin="8dp"
+                app:icon="@android:drawable/ic_input_add" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:padding="16dp"
+                android:text="@string/history"
+                android:textAppearance="@style/TextAppearance.AppCompat.Medium"
+                android:textStyle="bold" />
+
+            <View
+                android:layout_width="match_parent"
+                android:layout_height="1dp"
+                android:background="?android:attr/listDivider" />
+
+            <!-- Guest View -->
+            <LinearLayout
+                android:id="@+id/guest_view_nav"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:padding="16dp"
+                android:gravity="center_horizontal"
+                android:visibility="gone">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/login_required_for_history"
+                    android:textAlignment="center"
+                    android:layout_marginBottom="8dp"/>
+
+                <Button
+                    android:id="@+id/btn_login_nav"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/login"/>
+            </LinearLayout>
+
+            <!-- Logged In View -->
+            <androidx.recyclerview.widget.RecyclerView
+                android:id="@+id/history_recycler_view_nav"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                tools:listitem="@layout/item_ocr_result"
+                android:visibility="gone"/>
+
+        </LinearLayout>
+    </com.google.android.material.navigation.NavigationView>
 
 </androidx.drawerlayout.widget.DrawerLayout>

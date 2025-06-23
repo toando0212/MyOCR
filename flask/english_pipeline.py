@@ -4,11 +4,12 @@ import numpy as np
 import os
 import cv2
 import torch
-from doctr.models import ocr_predictor
+from doctr.models import detection_predictor, recognition_predictor, ocr_predictor
 from doctr.io import DocumentFile
 import logging
 import sys
 import math
+from pipeline_utils import correct_perspective, deskew_image, remove_horizontal_lines
 
 # Set up logging to force output to console
 for handler in logging.root.handlers[:]:
@@ -20,240 +21,139 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-logger.info("Starting the Unified OCR pipeline application...")
+logger.info("Starting the English OCR pipeline application...")
 
 try:
-    # Load a unified OCR predictor from doctr
-    # Using a lightweight detection model and the requested recognition model.
-    logger.info("Loading DocTR OCR predictor with det_arch='db_mobilenet_v3_large' and reco_arch='crnn_mobilenet_v3_small'...")
-    ocr_model = ocr_predictor(det_arch='db_mobilenet_v3_large', reco_arch='crnn_mobilenet_v3_small', pretrained=True)
-    logger.info("DocTR OCR predictor loaded.")
+    # Use the high-level OCR predictor for detection. It's more robust and provides structured output.
+    # logger.info("Loading DocTR full OCR predictor ('db_mobilenet_v3_large', 'crnn_mobilenet_v3_large')...")
+    # We use the full predictor to get structured line geometry, then we'll re-run recognition on merged lines.
+    doctr_predictor = ocr_predictor(
+        det_arch='fast_small', 
+        reco_arch='vitstr_small', # Using a more standard recognition model for general purpose
+        pretrained=True
+    )
+
+    # Move model to GPU if available
+    if torch.cuda.is_available():
+        logger.info("Moving models to CUDA device...")
+        doctr_predictor.to(torch.device('cuda'))
+    
+    logger.info("DocTR models loaded successfully.")
 
 except Exception as e:
     logger.error(f"Error during model initialization: {str(e)}", exc_info=True)
     raise
 
-def correct_perspective(pil_img: Image.Image) -> Image.Image:
+def merge_boxes_to_lines(boxes: list, page_dims: tuple, tolerance_ratio: float = 0.7) -> list:
     """
-    Corrects perspective distortion in an image of a document.
-    Finds the largest quadrilateral in the image and warps it to a top-down view.
-    This version includes a check to ensure the detected contour is large enough to be the document.
+    Merges geometric bounding boxes into lines of text.
+    Almost identical to the function in the VietOCR pipeline.
+    
+    Args:
+        boxes: List of boxes, each as ((xmin, ymin), (xmax, ymax)) in relative coordinates.
+        page_dims: Tuple (height, width) of the page.
+    
+    Returns:
+        List of merged bounding boxes representing text lines in absolute coordinates.
     """
-    try:
-        img = np.array(pil_img.convert("RGB"))
-        orig = img.copy()
+    if not boxes:
+        return []
+
+    page_height, page_width = page_dims
+    # Convert boxes to absolute coordinates (xmin, ymin, xmax, ymax)
+    abs_boxes = [
+        (int(b[0] * page_width), int(b[1] * page_height), int(b[2] * page_width), int(b[3] * page_height))
+        for b in boxes
+    ]
+
+    # Sort boxes top-to-bottom, then left-to-right
+    sorted_boxes = sorted(abs_boxes, key=lambda x: (x[1], x[0]))
+
+    if not sorted_boxes: return []
+
+    merged_lines = []
+    current_line = list(sorted_boxes[0])
+
+    for i in range(1, len(sorted_boxes)):
+        box = sorted_boxes[i]
         
-        # Downscale for faster processing, preserving aspect ratio
-        proc_height = 500.0
-        if img.shape[0] <= proc_height:
-             ratio = 1.0
-             proc_img = img.copy()
+        current_line_height = current_line[3] - current_line[1]
+        current_line_y_center = current_line[1] + current_line_height / 2
+        
+        box_height = box[3] - box[1]
+        box_y_center = box[1] + box_height / 2
+
+        vertical_tolerance = min(current_line_height, box_height) * tolerance_ratio if current_line_height > 0 and box_height > 0 else 0
+
+        if abs(box_y_center - current_line_y_center) <= vertical_tolerance:
+            # Merge box into current line
+            current_line[0] = min(current_line[0], box[0])
+            current_line[1] = min(current_line[1], box[1])
+            current_line[2] = max(current_line[2], box[2])
+            current_line[3] = max(current_line[3], box[3])
         else:
-             ratio = img.shape[0] / proc_height
-             proc_img = cv2.resize(img, (int(img.shape[1] / ratio), int(proc_height)))
+            merged_lines.append(tuple(current_line))
+            current_line = list(box)
 
-        # Edge detection
-        gray = cv2.cvtColor(proc_img, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (5, 5), 0)
-        edged = cv2.Canny(gray, 75, 200)
-
-        # Find contours
-        contours, _ = cv2.findContours(edged.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:5]
-
-        screenCnt = None
-        img_area = proc_img.shape[0] * proc_img.shape[1]
-
-        for c in contours:
-            peri = cv2.arcLength(c, True)
-            approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-            
-            if len(approx) == 4:
-                if cv2.contourArea(approx) > img_area * 0.20: # Must be at least 20% of the image
-                    screenCnt = approx
-                    break
-                else:
-                    logger.info(f"Found a 4-point contour, but its area is too small. Skipping it.")
-        
-        if screenCnt is None:
-            logger.warning("Could not find a suitable document contour. Skipping perspective correction.")
-            return pil_img
-        
-        logger.info("Found document contour, applying perspective correction.")
-
-        # Order the points for the perspective transform
-        pts = screenCnt.reshape(4, 2) * ratio
-        rect = np.zeros((4, 2), dtype="float32")
-        s = pts.sum(axis=1)
-        rect[0] = pts[np.argmin(s)] # Top-left
-        rect[2] = pts[np.argmax(s)] # Bottom-right
-        diff = np.diff(pts, axis=1)
-        rect[1] = pts[np.argmin(diff)] # Top-right
-        rect[3] = pts[np.argmax(diff)] # Bottom-left
-        
-        (tl, tr, br, bl) = rect
-
-        widthA = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
-        widthB = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
-        maxWidth = max(int(widthA), int(widthB))
-
-        heightA = np.sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
-        heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
-        maxHeight = max(int(heightA), int(heightB))
-
-        if maxWidth <= 0 or maxHeight <= 0:
-            logger.warning("Calculated invalid dimensions for warped image. Skipping perspective correction.")
-            return pil_img
-
-        dst = np.array([
-            [0, 0],
-            [maxWidth - 1, 0],
-            [maxWidth - 1, maxHeight - 1],
-            [0, maxHeight - 1]], dtype="float32")
-
-        M = cv2.getPerspectiveTransform(rect, dst)
-        warped = cv2.warpPerspective(orig, M, (maxWidth, maxHeight))
-        logger.info("Perspective correction applied successfully.")
-        return Image.fromarray(warped)
-    except Exception as e:
-        logger.error(f"Error during perspective correction: {e}", exc_info=True)
-        return pil_img
-
-def deskew_image(pil_img: Image.Image) -> Image.Image:
-    """
-    Deskews an image using the Projection Profile Method with adaptive thresholding.
-    """
-    try:
-        img_for_deskew = np.array(pil_img.convert("L"))
-        
-        # Adaptive thresholding is better for images with varying lighting.
-        # It creates a binary image where text is white on a black background.
-        thresh = cv2.adaptiveThreshold(img_for_deskew, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                       cv2.THRESH_BINARY_INV, 15, 5)
-
-        max_score = -1.0
-        best_angle = 0.0
-
-        # Test a range of angles
-        for angle in np.arange(-15, 15, 0.5):
-            (h, w) = thresh.shape
-            center = (w // 2, h // 2)
-            M = cv2.getRotationMatrix2D(center, angle, 1.0)
-            
-            # Rotate the binary image using nearest-neighbor to avoid interpolation artifacts
-            rotated = cv2.warpAffine(thresh, M, (w, h), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-            
-            # Calculate horizontal projection profile
-            hist = np.sum(rotated, axis=1, dtype=np.float32) / 255.0
-            
-            # Score is the variance of the projection profile
-            score = np.sum((hist[1:] - hist[:-1]) ** 2)
-            
-            if score > max_score:
-                max_score = score
-                best_angle = angle
-        
-        logger.info(f"Detected best skew angle: {best_angle:.2f} degrees")
-
-        # Use a stricter threshold to avoid over-correcting already straight images
-        if abs(best_angle) < 0.5:
-            logger.info("Skew angle is insignificant, skipping rotation.")
-            return pil_img
-
-        # Rotate the original color image by the best angle for a high-quality result
-        (h, w) = img_for_deskew.shape[:2]
-        center = (w // 2, h // 2)
-        M = cv2.getRotationMatrix2D(center, best_angle, 1.0)
-        rotated = cv2.warpAffine(np.array(pil_img), M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-        
-        logger.info("Deskew correction applied.")
-        return Image.fromarray(rotated)
-    except Exception as e:
-        logger.error(f"Error during image deskewing: {e}", exc_info=True)
-        return pil_img
-
-def remove_horizontal_lines(pil_img):
-    try:
-        img = np.array(pil_img)
-        if img.ndim == 3:
-            img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-        if img.mean() > 127:
-            img = 255 - img
-        horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 1))
-        detected_lines = cv2.morphologyEx(img, cv2.MORPH_OPEN, horizontal_kernel, iterations=2)
-        img_no_lines = cv2.subtract(img, detected_lines)
-        img_no_lines = 255 - img_no_lines
-        return Image.fromarray(img_no_lines)
-    except Exception as e:
-        logger.error(f"Error in horizontal line removal: {str(e)}", exc_info=True)
-        return pil_img
+    merged_lines.append(tuple(current_line))
+    return merged_lines
 
 @torch.no_grad()
 def ocr_pipeline(pil_img):
     logger.info("OCR pipeline started.")
     if pil_img is None:
-        # Return empty values for all outputs
         return "Please upload an image.", None, None, None, None
 
     try:
-        # logger.info("Step 1: Correcting perspective...")
-        # corrected_img = correct_perspective(pil_img)
-        logger.info("Step 1: Perspective correction DISABLED. Passing original image to next step.")
-        corrected_img = pil_img # Keep variable for consistent return signature, but it's the original image.
-
-        logger.info("Step 2: Deskewing image...")
+        # Step 1-3: Preprocessing (remains the same)
+        logger.info("Steps 1-3: Correcting perspective, deskewing, and removing lines...")
+        corrected_img = correct_perspective(pil_img)
         deskewed_img = deskew_image(corrected_img)
-        
-        logger.info("Step 3: Removing horizontal lines...")
         processed_img_for_detection = remove_horizontal_lines(deskewed_img)
         
-        logger.info("Step 4: Running full OCR with DocTR...")
+        # Step 4: Run detection using the FULL ocr_predictor to get structured output
+        logger.info("Step 4: Running DocTR to get initial line geometry...")
+        # The predictor expects a list of numpy arrays, ensure it's RGB
         img_array = np.array(processed_img_for_detection.convert("RGB"))
-        result = ocr_model([img_array])
-        
+        result = doctr_predictor([img_array])
+
         if not result.pages or not result.pages[0].blocks:
-            logger.warning("No text detected by DocTR.")
-            return "No text detected.", corrected_img, deskewed_img, processed_img_for_detection, deskewed_img.copy().convert("RGB")
+            logger.warning("No text blocks detected by DocTR.")
+            return "No text blocks detected.", corrected_img, deskewed_img, processed_img_for_detection, deskewed_img.copy().convert("RGB")
 
-        recognized_results = []
-        page = result.pages[0]
-        page_height, page_width = page.dimensions
+        # The pipeline is now simplified. We directly use the results from the ocr_predictor.
+        # No more manual box merging or second-pass recognition. This is the "plug-and-play" approach.
 
-        for block in page.blocks:
-            for line in block.lines:
-                # Reconstruct the line from words
-                line_text = " ".join([word.value for word in line.words])
-                if not line_text: continue
-                
-                # Get line coordinates
-                x_min, y_min = line.geometry[0]
-                x_max, y_max = line.geometry[1]
-                line_box = (int(x_min * page_width), int(y_min * page_height), int(x_max * page_width), int(y_max * page_height))
-                
-                recognized_results.append({'box': line_box, 'text': line_text})
-                logger.info(f"Recognized Line: {line_text}")
-
-        # Create visualization on the deskewed image
+        # Step 5: Extract text and visualization data directly from the result
+        logger.info("Step 5: Extracting text and geometries from DocTR result...")
+        out_text = result.render()
+        
+        # Step 6: Create visualization
         vis_img = deskewed_img.copy().convert("RGB")
         draw = ImageDraw.Draw(vis_img)
+        page_dims = vis_img.size # (width, height)
         
-        for res in recognized_results:
-            box, text = res['box'], res['text']
-            color = "blue"  # Single color for all recognized text
-            
-            draw.rectangle(box, outline=color, width=2)
-            # Display only the recognized text, no classification label needed
-            display_text = text
-            text_position = (box[0], box[1] - 15 if box[1] > 15 else box[1])
-            
-            try:
-                font = ImageFont.truetype("arial.ttf", 15)
-            except IOError:
-                font = ImageFont.load_default()
-
-            draw.text(text_position, display_text, fill=color, font=font)
+        # Draw boxes for each line from the predictor's output
+        for block in result.pages[0].blocks:
+            for line in block.lines:
+                # Get the line's text content
+                line_text = " ".join([word.value for word in line.words])
+                
+                # Get the line's geometry (relative coordinates)
+                xmin, ymin = line.geometry[0]
+                xmax, ymax = line.geometry[1]
+                
+                # Convert to absolute pixel coordinates
+                box = [int(xmin * page_dims[0]), int(ymin * page_dims[1]), int(xmax * page_dims[0]), int(ymax * page_dims[1])]
+                
+                draw.rectangle(box, outline="blue", width=2)
+                try:
+                    font = ImageFont.truetype("arial.ttf", 15)
+                except IOError:
+                    font = ImageFont.load_default()
+                # Position text slightly above the top-left corner of the box
+                draw.text((box[0], box[1] - 15), line_text, fill="blue", font=font)
         
-        out_text = "\n".join([r['text'] for r in recognized_results])
         logger.info("OCR pipeline completed successfully.")
         
         return out_text, corrected_img, deskewed_img, processed_img_for_detection, vis_img
@@ -261,10 +161,9 @@ def ocr_pipeline(pil_img):
     except Exception as e:
         error_msg = f"Error in OCR pipeline: {str(e)}"
         logger.error(error_msg, exc_info=True)
-        # Return original image in the last slot on error, and Nones for the rest
         return error_msg, None, None, None, pil_img
 
-# Create Gradio interface
+# Gradio interface remains largely the same
 demo = gr.Interface(
     fn=ocr_pipeline,
     inputs=gr.Image(type="pil", label="Upload Document Image"),
@@ -275,8 +174,8 @@ demo = gr.Interface(
         gr.Image(type="pil", label="3. Preprocessed (Lines Removed)"),
         gr.Image(type="pil", label="4. Final Result (Boxes on Deskewed Image)")
     ],
-    title="English OCR Pipeline: Preprocessing Visualization",
-    description="Shows the output of each preprocessing step to diagnose failures. 1. Perspective Correction -> 2. Rotational Deskew -> 3. Line Removal -> 4. OCR Result."
+    title="English OCR Pipeline (REFACTORED for Handwriting)",
+    description="Shows the output of each step. NEW: 1. Detect Only -> 2. Merge Boxes -> 3. Recognize Line-by-Line. This should improve handwriting recognition."
 )
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ import android.widget.ImageView;
 import android.widget.ImageButton;
 
 import androidx.annotation.NonNull;
+import androidx.appcompat.app.AlertDialog;
 import androidx.recyclerview.widget.RecyclerView;
 
 import java.util.List;
@@ -16,10 +17,16 @@ import java.util.List;
 public class ImageAdapter extends RecyclerView.Adapter<ImageAdapter.ViewHolder> {
     private List<Uri> imageUris;
     private Context context;
+    private OnImageClickListener listener;
 
-    public ImageAdapter(Context context, List<Uri> imageUris) {
+    public interface OnImageClickListener {
+        void onImageClick(Uri imageUri);
+    }
+
+    public ImageAdapter(Context context, List<Uri> imageUris, OnImageClickListener listener) {
         this.context = context;
         this.imageUris = imageUris;
+        this.listener = listener;
     }
 
     @NonNull
@@ -34,10 +41,27 @@ public class ImageAdapter extends RecyclerView.Adapter<ImageAdapter.ViewHolder> 
         Uri uri = imageUris.get(position);
         holder.imageView.setImageURI(uri);
 
+        holder.imageView.setOnClickListener(v -> {
+            if (listener != null) {
+                listener.onImageClick(uri);
+            }
+        });
+
         holder.btnDelete.setOnClickListener(v -> {
-            imageUris.remove(position);
-            notifyItemRemoved(position);
-            notifyItemRangeChanged(position, imageUris.size());
+            new AlertDialog.Builder(context)
+                    .setTitle(R.string.delete_image_title)
+                    .setMessage(R.string.delete_image_confirmation)
+                    .setPositiveButton(R.string.delete, (dialog, which) -> {
+                        // User clicked "Delete"
+                        int currentPosition = holder.getAdapterPosition();
+                        if (currentPosition != RecyclerView.NO_POSITION) {
+                            imageUris.remove(currentPosition);
+                            notifyItemRemoved(currentPosition);
+                            notifyItemRangeChanged(currentPosition, imageUris.size());
+                        }
+                    })
+                    .setNegativeButton(R.string.cancel, null)
+                    .show();
         });
     }
 

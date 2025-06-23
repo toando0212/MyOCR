@@ -2,10 +2,13 @@
 <network-security-config>
     <domain-config cleartextTrafficPermitted="true">
         
-        <domain includeSubdomains="true">192.168.1.229</domain>
+        <domain includeSubdomains="true">192.168.1.220</domain>
+        <domain includeSubdomains="true">172.20.10.3</domain>
+
         <domain includeSubdomains="true">10.0.2.2</domain>
         <domain includeSubdomains="true">0a0d-2405-4803-f58e-c00-7939-c3de-c048-57c9.ngrok-free.app</domain>
         <domain includeSubdomains="true">256f-2405-4803-f58e-c00-2889-9a46-e50b-38c1.ngrok-free.app</domain>
-        <domain includeSubdomains="true">3e8f-42-114-227-240.ngrok-free.app</domain>
+        <domain includeSubdomains="true">fdab-2405-4803-f801-12a0-4ff-3af2-975b-4309.ngrok-free.app</domain>
+        <domain includeSubdomains="true">7c2c-2405-4803-f801-12a0-1883-6ffe-89a4-5660.ngrok-free.app</domain>
     </domain-config>
 </network-security-config>

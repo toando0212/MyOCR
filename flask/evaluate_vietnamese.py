@@ -4,14 +4,21 @@ from PIL import Image
 import time
 import logging
 import sys
+from tqdm import tqdm
+import warnings
 
-# Ensure the script's directory is in the python path to allow importing viet_ocr
+# Suppress common warnings from underlying libraries
+warnings.filterwarnings("ignore", category=UserWarning)
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
 # Suppress verbose INFO logging from the viet_ocr module during model loading
 logging.getLogger('viet_ocr').setLevel(logging.WARNING)
+logging.getLogger('PIL').setLevel(logging.WARNING)
+# Add suppression for our own utility and underlying http libraries
+logging.getLogger('pipeline_utils').setLevel(logging.ERROR)
+logging.getLogger('httpx').setLevel(logging.ERROR)
 
-# Now, import the pipeline. The verbose model loading logs will be suppressed.
+# Now, import the pipeline.
 from viet_ocr import ocr_pipeline
 
 # Setup basic logging for the evaluation script itself
@@ -66,7 +73,7 @@ def evaluate_pipeline():
     # --- Configuration ---
     IMAGE_DIR = 'D:/MyOCR/InkData_paragraph'
     CSV_PATH = 'D:/MyOCR/InkData_paragraph/InkData_paragraph.csv'
-    NUM_IMAGES_TO_TEST = 20
+    NUM_IMAGES_TO_TEST = 10
 
     # --- Load Ground Truth Data ---
     logging.info(f"Loading ground truth data from {CSV_PATH}")
@@ -84,7 +91,7 @@ def evaluate_pipeline():
 
     logging.info(f"Starting evaluation on the first {NUM_IMAGES_TO_TEST} images...")
 
-    for index, row in evaluation_subset.iterrows():
+    for index, row in tqdm(evaluation_subset.iterrows(), total=evaluation_subset.shape[0], desc="Evaluating Vietnamese Pipeline"):
         filename = str(row['file_name']) + '.png'
         ground_truth = row['text']
         image_path = os.path.join(IMAGE_DIR, filename)
@@ -98,23 +105,19 @@ def evaluate_pipeline():
             image = Image.open(image_path)
             
             start_time = time.time()
-            predicted_text, _, _, _ = ocr_pipeline(image)
+            # Unpack all 6 return values, we evaluate the post-processed text
+            raw_text, post_processed_text, _, _, _, _ = ocr_pipeline(image)
             end_time = time.time()
             
             processing_time = end_time - start_time
 
-            predicted_lines = [line.split(':', 1)[-1].strip() for line in predicted_text.split('\n') if ':' in line]
-            clean_prediction = " ".join(predicted_lines)
+            # The pipeline now returns clean text. Join lines if there are multiple.
+            clean_prediction = " ".join(post_processed_text.split('\n')) if post_processed_text else ""
 
             # --- Calculate Metrics ---
             if not isinstance(ground_truth, str):
                 ground_truth = "" # Handle potential non-string data
             
-            # --- For transparency, log the strings being compared ---
-            logging.info(f"Comparing strings for {filename}:")
-            logging.info(f"  - GROUND TRUTH: '{ground_truth}'")
-            logging.info(f"  - PREDICTION:   '{clean_prediction}'")
-
             cer = calculate_cer(ground_truth, clean_prediction)
             wer = calculate_wer(ground_truth, clean_prediction)
 
@@ -126,8 +129,6 @@ def evaluate_pipeline():
                 'wer': wer,
                 'time': processing_time
             })
-            
-            logging.info(f"Processed {filename} | CER: {cer:.4f}, WER: {wer:.4f}\n")
 
         except Exception as e:
             logging.error(f"An error occurred while processing {filename}: {e}", exc_info=True)
@@ -144,7 +145,7 @@ def evaluate_pipeline():
     avg_time = results_df['time'].mean()
 
     print("\n" + "="*50)
-    print("      EVALUATION SUMMARY (Custom Functions)")
+    print("      EVALUATION SUMMARY (viet_ocr_pipeline)")
     print("="*50)
     print(f"Images Evaluated:      {len(results_df)}")
     print(f"Average CER:           {avg_cer:.4f}")

@@ -5,20 +5,15 @@ import os
 from werkzeug.utils import secure_filename
 import cv2
 import numpy as np
-from joblib import load
-import io
 from werkzeug.security import generate_password_hash, check_password_hash
-from PIL import Image, ImageDraw, ImageFont
-import time
-import torch
-from transformers import TrOCRProcessor, VisionEncoderDecoderModel
-from doctr.models import detection_predictor
-from doctr.io import DocumentFile
-from doctr.models.builder import DocumentBuilder
-from vietocr.tool.predictor import Predictor
-from vietocr.tool.config import Cfg
-import math
+from PIL import Image
+import io
 import base64
+
+# Import the OCR pipelines
+# These files now contain all the model loading and processing logic.
+from english_pipeline import ocr_pipeline as process_english
+from viet_ocr import ocr_pipeline as process_vietnamese
 
 # Global constants
 app = Flask(__name__)
@@ -34,401 +29,14 @@ os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
 mysql = MySQL(app)
 
-# --- Model Loading ---
-print("Loading models...")
-# Classifier for handwritten/printed text
-MODEL_PATH = 'full_model.joblib'
-try:
-    classifier_model = load(MODEL_PATH)
-    print("Classifier model loaded.")
-except Exception as e:
-    print(f"Could not load classifier model: {e}")
-    classifier_model = None
+# --- Model Loading is now handled within the imported pipeline files ---
+print("All models are being loaded by their respective pipeline modules...")
 
-# Doctr for line segmentation
-det_model = detection_predictor(arch="db_mobilenet_v3_large", pretrained=True)
-print("DocTR detection model loaded.")
-
-# VietOCR for Vietnamese text recognition
-vietocr_config = Cfg.load_config_from_name('vgg_seq2seq')
-vietocr_config['device'] = 'cpu'
-vietocr_config['predictor']['beamsearch'] = False
-vietocr_predictor = Predictor(vietocr_config)
-print("VietOCR model loaded.")
-
-# TrOCR for English text recognition
-printed_processor = TrOCRProcessor.from_pretrained("microsoft/trocr-small-printed")
-printed_model = VisionEncoderDecoderModel.from_pretrained("microsoft/trocr-small-printed")
-printed_model.to("cpu")
-print("TrOCR Printed model loaded.")
-
-handwritten_processor = TrOCRProcessor.from_pretrained("microsoft/trocr-small-handwritten")
-handwritten_model = VisionEncoderDecoderModel.from_pretrained("microsoft/trocr-small-handwritten")
-handwritten_model.to("cpu")
-print("TrOCR Handwritten model loaded.")
-print("All models loaded successfully.")
-
-
-def extract_features(img):
-    """Extracts features for the classifier from a given image region."""
-    if len(img.shape) == 3:
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    
-    rows, cols = img.shape
-    if cols == 0 or rows == 0:
-        return [0, 0, 0, 0, 0]
-
-    arr = [rows, cols, rows / cols if cols > 0 else 0]
-    
-    _, bwMask = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
-    
-    myavg = 0
-    if cols > 0:
-        for xx in range(cols):
-            mycnt = np.sum(bwMask[:, xx] == 0)
-            myavg += (mycnt * 1.0) / rows
-        myavg /= cols
-    arr.append(myavg)
-    
-    change = 0
-    if rows > 0:
-        for xx in range(rows):
-            row_data = bwMask[xx, :]
-            mycnt = np.sum(row_data[:-1] != row_data[1:])
-            change += (mycnt * 1.0) / (cols if cols > 0 else 1)
-        change /= rows
-    arr.append(change)
-    
-    return arr
-
-def classify_region(roi_img):
-    """Classifies an image region as 'Handwritten' or 'Printed'."""
-    if classifier_model is None:
-        return "Printed" # Default if model is not available
-    try:
-        features = extract_features(np.array(roi_img))
-        pred = classifier_model.predict([features])[0]
-        return str(pred)
-    except Exception as e:
-        print(f"Classification failed: {e}")
-        return "Unknown"
-
-def correct_perspective(pil_img: Image.Image) -> Image.Image:
-    """
-    Corrects perspective distortion in an image of a document.
-    Finds the largest quadrilateral in the image and warps it to a top-down view.
-    This version includes a check to ensure the detected contour is large enough to be the document.
-    """
-    try:
-        img = np.array(pil_img.convert("RGB"))
-        orig = img.copy()
-        
-        # Downscale for faster processing, preserving aspect ratio
-        proc_height = 500.0
-        # Handle cases where the image is smaller than the processing height
-        if img.shape[0] <= proc_height:
-             ratio = 1.0
-             proc_img = img.copy()
-        else:
-             ratio = img.shape[0] / proc_height
-             proc_img = cv2.resize(img, (int(img.shape[1] / ratio), int(proc_height)))
-
-        # Edge detection
-        gray = cv2.cvtColor(proc_img, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (5, 5), 0)
-        edged = cv2.Canny(gray, 75, 200)
-
-        # Find contours
-        contours, _ = cv2.findContours(edged.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:5]
-
-        screenCnt = None
-        img_area = proc_img.shape[0] * proc_img.shape[1]
-
-        for c in contours:
-            peri = cv2.arcLength(c, True)
-            approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-            
-            # We are looking for a 4-point contour that is sufficiently large
-            if len(approx) == 4:
-                if cv2.contourArea(approx) > img_area * 0.20: # Must be at least 20% of the image
-                    screenCnt = approx
-                    break
-                else:
-                    # This logs that a small contour was found and skipped, which can be useful for debugging
-                    print(f"Info: Found a 4-point contour, but its area is too small. Skipping it.")
-        
-        if screenCnt is None:
-            print("Info: Could not find a suitable document contour. Skipping perspective correction.")
-            return pil_img
-        
-        print("Info: Found document contour, applying perspective correction.")
-
-        # Order the points for the perspective transform
-        pts = screenCnt.reshape(4, 2) * ratio
-        rect = np.zeros((4, 2), dtype="float32")
-        s = pts.sum(axis=1)
-        rect[0] = pts[np.argmin(s)] # Top-left
-        rect[2] = pts[np.argmax(s)] # Bottom-right
-        diff = np.diff(pts, axis=1)
-        rect[1] = pts[np.argmin(diff)] # Top-right
-        rect[3] = pts[np.argmax(diff)] # Bottom-left
-        
-        (tl, tr, br, bl) = rect
-
-        widthA = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
-        widthB = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
-        maxWidth = max(int(widthA), int(widthB))
-
-        heightA = np.sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
-        heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
-        maxHeight = max(int(heightA), int(heightB))
-
-        # Ensure the warped image dimensions are valid
-        if maxWidth <= 0 or maxHeight <= 0:
-            print("Warning: Calculated invalid dimensions for warped image. Skipping perspective correction.")
-            return pil_img
-
-        dst = np.array([
-            [0, 0],
-            [maxWidth - 1, 0],
-            [maxWidth - 1, maxHeight - 1],
-            [0, maxHeight - 1]], dtype="float32")
-
-        M = cv2.getPerspectiveTransform(rect, dst)
-        warped = cv2.warpPerspective(orig, M, (maxWidth, maxHeight))
-
-        return Image.fromarray(warped)
-    except Exception as e:
-        print(f"Error during perspective correction: {e}")
-        return pil_img
-
-def deskew_image(pil_img: Image.Image) -> Image.Image:
-    """
-    Deskews an image using the Projection Profile Method with adaptive thresholding.
-    """
-    try:
-        img_for_deskew = np.array(pil_img.convert("L"))
-        
-        # Adaptive thresholding is better for images with varying lighting.
-        thresh = cv2.adaptiveThreshold(img_for_deskew, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                       cv2.THRESH_BINARY_INV, 15, 5)
-
-        max_score = -1.0
-        best_angle = 0.0
-
-        # Test a range of angles
-        for angle in np.arange(-15, 15, 0.5):
-            (h, w) = thresh.shape
-            center = (w // 2, h // 2)
-            M = cv2.getRotationMatrix2D(center, angle, 1.0)
-            
-            # Rotate the binary image using nearest-neighbor to avoid interpolation artifacts
-            rotated = cv2.warpAffine(thresh, M, (w, h), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-            
-            # Calculate horizontal projection profile
-            hist = np.sum(rotated, axis=1, dtype=np.float32) / 255.0
-            
-            # Score is the variance of the projection profile
-            score = np.sum((hist[1:] - hist[:-1]) ** 2)
-            
-            if score > max_score:
-                max_score = score
-                best_angle = angle
-        
-        print(f"Detected best skew angle: {best_angle:.2f} degrees")
-
-        # Use a stricter threshold to avoid over-correcting already straight images
-        if abs(best_angle) < 0.5:
-            print("Skew angle is insignificant, skipping rotation.")
-            return pil_img
-
-        # Rotate the original color image by the best angle for a high-quality result
-        (h, w) = img_for_deskew.shape[:2]
-        center = (w // 2, h // 2)
-        M = cv2.getRotationMatrix2D(center, best_angle, 1.0)
-        rotated = cv2.warpAffine(np.array(pil_img), M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-        
-        print("Deskew correction applied.")
-        return Image.fromarray(rotated)
-    except Exception as e:
-        print(f"Error during image deskewing: {e}")
-        return pil_img
-
-def remove_horizontal_lines(pil_img):
-    try:
-        img = np.array(pil_img)
-        if img.ndim == 3:
-            img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-        if img.mean() > 127:
-            img = 255 - img
-        horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 1))
-        detected_lines = cv2.morphologyEx(img, cv2.MORPH_OPEN, horizontal_kernel, iterations=2)
-        img_no_lines = cv2.subtract(img, detected_lines)
-        img_no_lines = 255 - img_no_lines
-        return Image.fromarray(img_no_lines)
-    except Exception as e:
-        print(f"Error in horizontal line removal: {e}")
-        return pil_img
-
-def doctr_segment_lines(pil_img):
-    """Segments an image into lines of text using DocTR."""
-    temp_path = None
-    try:
-        temp_path = "temp_input_doctr.png"
-        pil_img.convert("RGB").save(temp_path)
-        
-        doc = DocumentFile.from_images(temp_path)
-        result = det_model(doc)
-        
-        if not result or 'words' not in result[0] or result[0]['words'].shape[0] == 0:
-            return []
-
-        page = result[0]
-        img_width, img_height = pil_img.size
-        words = [
-            (int(w[0] * img_width), int(w[1] * img_height), int(w[2] * img_width), int(w[3] * img_height))
-            for w in page['words'][:, :-1]
-        ]
-        words.sort(key=lambda w: (w[1], w[0]))
-
-        if not words:
-            return []
-
-        lines = []
-        current_line = [words[0]]
-        for box in words[1:]:
-            last_box = current_line[-1]
-            last_box_y_center = (last_box[1] + last_box[3]) / 2
-            current_box_y_center = (box[1] + box[3]) / 2
-            last_box_height = last_box[3] - last_box[1]
-
-            if abs(current_box_y_center - last_box_y_center) < last_box_height * 0.7:
-                current_line.append(box)
-            else:
-                min_x = min(b[0] for b in current_line)
-                min_y = min(b[1] for b in current_line)
-                max_x = max(b[2] for b in current_line)
-                max_y = max(b[3] for b in current_line)
-                lines.append((min_x, min_y, max_x, max_y))
-                current_line = [box]
-        
-        if current_line:
-            min_x = min(b[0] for b in current_line)
-            min_y = min(b[1] for b in current_line)
-            max_x = max(b[2] for b in current_line)
-            max_y = max(b[3] for b in current_line)
-            lines.append((min_x, min_y, max_x, max_y))
-
-        return lines
-    except Exception as e:
-        print(f"Error in line segmentation: {e}")
-        return []
-    finally:
-        if temp_path and os.path.exists(temp_path):
-            os.remove(temp_path)
-
-@torch.no_grad()
-def run_english_pipeline(pil_img):
-    """Full English OCR pipeline."""
-    # 1. Preprocessing
-    corrected_img = correct_perspective(pil_img)
-    deskewed_img = deskew_image(corrected_img)
-    # Use one image for detection (lines removed) and another for recognition (cleaner)
-    processed_img_for_detection = remove_horizontal_lines(deskewed_img)
-    
-    # 2. Line Detection
-    line_boxes = doctr_segment_lines(processed_img_for_detection)
-    if not line_boxes:
-        return [], pil_img
-
-    # 3. Recognition per line
-    ocr_results = []
-    vis_img = deskewed_img.copy().convert("RGB")
-    draw = ImageDraw.Draw(vis_img)
-    try:
-        font = ImageFont.truetype("arial.ttf", 15)
-    except IOError:
-        font = ImageFont.load_default()
-
-    for i, box in enumerate(line_boxes):
-        x_min, y_min, x_max, y_max = box
-        # IMPORTANT: Crop from the deskewed image, not the one with lines removed
-        crop = deskewed_img.crop((x_min, y_min, x_max, y_max))
-        
-        if np.array(crop).std() < 10:
-            continue
-
-        line_label = classify_region(crop.convert("RGB"))
-        
-        if 'handwritten' in line_label.lower():
-            processor, model = handwritten_processor, handwritten_model
-        else:
-            processor, model = printed_processor, printed_model
-        
-        pixel_values = processor(images=crop.convert("RGB"), return_tensors="pt").pixel_values
-        generated_ids = model.generate(pixel_values)
-        text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
-        
-        if len(text) < 2:
-            continue
-
-        ocr_results.append({'block_index': i, 'box': box, 'label': line_label, 'text': text})
-        
-        color = "green" if 'handwritten' in line_label.lower() else "blue"
-        draw.rectangle(box, outline=color, width=2)
-        display_text = f"[{line_label}] {text}"
-        text_position = (box[0], box[1] - 15 if box[1] > 15 else box[1])
-        draw.text(text_position, display_text, fill=color, font=font)
-        
-    return ocr_results, vis_img
-
-@torch.no_grad()
-def run_vietnamese_pipeline(pil_img):
-    """Full Vietnamese OCR pipeline."""
-    # 1. Preprocessing
-    corrected_img = correct_perspective(pil_img)
-    deskewed_img = deskew_image(corrected_img)
-    # Use one image for detection (lines removed) and another for recognition (cleaner)
-    processed_img_for_detection = remove_horizontal_lines(deskewed_img)
-    
-    # 2. Line Detection
-    line_boxes = doctr_segment_lines(processed_img_for_detection)
-    if not line_boxes:
-        return [], pil_img
-
-    # 3. Recognition per line
-    ocr_results = []
-    vis_img = deskewed_img.copy().convert("RGB")
-    draw = ImageDraw.Draw(vis_img)
-    try:
-        font = ImageFont.truetype("arial.ttf", 15)
-    except IOError:
-        font = ImageFont.load_default()
-
-    for i, box in enumerate(line_boxes):
-        x_min, y_min, x_max, y_max = box
-        # IMPORTANT: Crop from the deskewed image, not the one with lines removed
-        crop = deskewed_img.crop((x_min, y_min, x_max, y_max))
-        
-        if np.array(crop).std() < 10:
-            continue
-            
-        text = vietocr_predictor.predict(crop)
-        
-        if len(text) < 2:
-            continue
-            
-        ocr_results.append({'block_index': i, 'box': box, 'label': 'Vietnamese', 'text': text})
-        
-        draw.rectangle(box, outline="orange", width=2)
-        text_position = (box[0], box[1] - 15 if box[1] > 15 else box[1])
-        draw.text(text_position, text, fill="orange", font=font)
-        
-    return ocr_results, vis_img
 
 def encode_image_to_base64(pil_img):
     """Encodes a PIL image to a base64 string."""
+    if pil_img is None:
+        return None
     buffered = io.BytesIO()
     pil_img.save(buffered, format="PNG")
     return base64.b64encode(buffered.getvalue()).decode('utf-8')
@@ -446,13 +54,15 @@ def classify_blocks():
         return jsonify({'error': 'No selected file'}), 400
     
     user_id = request.form.get('user_id')
+    language = request.form.get('language', 'eng').lower()
+
     if not user_id:
         return jsonify({'error': 'No user_id provided'}), 400
 
-    cur = None  # Initialize cur to None
+    cur = None
     try:
         # --- Save the file and record it in the database ---
-        filename = secure_filename(file.filename)
+        filename = secure_filename(f"{user_id}_{file.filename}")
         filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
         file.save(filepath)
 
@@ -460,36 +70,40 @@ def classify_blocks():
         cur.execute("INSERT INTO images (user_id, image_path) VALUES (%s, %s)", (user_id, filepath))
         image_id = cur.lastrowid
         
-        # --- Process the image for OCR ---
-        # Re-read the file from the beginning of the stream for processing
-        file.seek(0)
-        in_memory_file = io.BytesIO(file.read())
-        data = np.frombuffer(in_memory_file.getvalue(), dtype=np.uint8)
-        img_cv = cv2.imdecode(data, cv2.IMREAD_COLOR)
-        if img_cv is None:
-            raise ValueError("Invalid image file, could not be decoded by OpenCV.")
+        # --- Process the image for OCR using imported pipelines ---
+        pil_img = Image.open(filepath).convert("RGB")
         
-        pil_img = Image.fromarray(cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB))
-        language = request.form.get('language', 'eng').lower()
+        recognized_text = ""
+        vis_img = None
 
         if language in ['vie', 'vi', 'vietnamese']:
-            print("Running Vietnamese OCR pipeline...")
-            ocr_results, vis_img = run_vietnamese_pipeline(pil_img)
+            print("Running Vietnamese OCR pipeline via import...")
+            # Unpack the results from the Vietnamese pipeline
+            # The second element is the post-processed text we want
+            raw_text, post_processed_text, _, _, _, vis_img = process_vietnamese(pil_img)
+            recognized_text = post_processed_text
         else:
-            print("Running English OCR pipeline...")
-            ocr_results, vis_img = run_english_pipeline(pil_img)
+            print("Running English OCR pipeline via import...")
+            # Unpack the results from the English pipeline
+            # The first element is the text we want
+            raw_text, _, _, _, vis_img = process_english(pil_img)
+            recognized_text = raw_text
 
         vis_base64 = encode_image_to_base64(vis_img)
 
         # --- Store OCR results in DB ---
-        if image_id:
-            recognized_text = "\n".join([block['text'] for block in ocr_results])
+        if image_id and recognized_text:
             cur.execute("INSERT INTO results (image_id, recognized_text) VALUES (%s, %s)", (image_id, recognized_text))
         
         mysql.connection.commit()
 
-        print(f"Pipeline finished. Found {len(ocr_results)} text blocks.")
-        return jsonify({'results': ocr_results, 'visualization': vis_base64}), 200
+        # --- Format the response for the Android client ---
+        # The client expects a 'results' array of objects, with each object having a 'text' key.
+        # We'll create a single result object containing all the recognized text.
+        api_results = [{'text': recognized_text}]
+
+        print(f"Pipeline finished. Returning {len(recognized_text.splitlines())} lines of text.")
+        return jsonify({'results': api_results, 'visualization': vis_base64}), 200
 
     except Exception as e:
         if cur:
@@ -537,5 +151,129 @@ def login():
         return jsonify({'error': 'Invalid username or password'}), 401
     return jsonify({'message': 'Login successful', 'user_id': user_id}), 200
 
+@app.route('/history/<int:user_id>', methods=['GET'])
+def get_history(user_id):
+    cur = None
+    try:
+        cur = mysql.connection.cursor()
+        # Fetch all records for the user, ordered by time
+        # IMPORTANT: Fetch the image ID (i.id) to identify records for deletion
+        query = """
+        SELECT i.id, i.image_path, r.recognized_text, i.uploaded_at
+        FROM images i
+        JOIN results r ON i.id = r.image_id
+        WHERE i.user_id = %s
+        ORDER BY i.uploaded_at ASC
+        """
+        cur.execute(query, (user_id,))
+        history_records = cur.fetchall()
+        
+        if not history_records:
+            return jsonify([]), 200
+
+        # Group records into sessions based on timestamp
+        sessions = []
+        if history_records:
+            current_session_records = [history_records[0]]
+            SESSION_TIMEOUT_SECONDS = 30  # Increased timeout for more robust session grouping
+
+            for i in range(1, len(history_records)):
+                prev_timestamp = current_session_records[-1][3] # Index 3 is uploaded_at
+                current_timestamp = history_records[i][3]
+                
+                if (current_timestamp - prev_timestamp).total_seconds() < SESSION_TIMEOUT_SECONDS:
+                    current_session_records.append(history_records[i])
+                else:
+                    sessions.append(current_session_records)
+                    current_session_records = [history_records[i]]
+            sessions.append(current_session_records) # Add the last session
+
+        # Format the sessions for the response
+        history_list = []
+        # A simple counter to act as a session ID for this request
+        temp_session_id_counter = 0
+        for session_records in reversed(sessions): # Show newest sessions first
+            session_details = []
+            session_image_ids = [] # Collect image IDs for this session
+            
+            for record in session_records:
+                image_id, image_path, recognized_text, _ = record
+                session_image_ids.append(image_id)
+                
+                encoded_image = None
+                if os.path.exists(image_path):
+                    with open(image_path, "rb") as image_file:
+                        encoded_image = base64.b64encode(image_file.read()).decode('utf-8')
+                
+                if encoded_image and recognized_text:
+                    session_details.append({
+                        'image_base64': encoded_image,
+                        'text': recognized_text
+                    })
+            
+            if session_details:
+                history_list.append({
+                    'session_id': temp_session_id_counter, # a temporary ID for the client
+                    'image_ids': session_image_ids, # The important part for deletion
+                    'timestamp': session_records[0][3].strftime('%Y-%m-%d %H:%M:%S'),
+                    'image_count': len(session_records),
+                    'results': session_details
+                })
+                temp_session_id_counter += 1
+            
+        return jsonify(history_list), 200
+
+    except Exception as e:
+        print(f"Error in /history endpoint: {e}")
+        return jsonify({'error': f'An unexpected error occurred: {str(e)}'}), 500
+    finally:
+        if cur:
+            cur.close()
+
+@app.route('/history/delete', methods=['POST'])
+def delete_history_session():
+    data = request.get_json()
+    image_ids_to_delete = data.get('image_ids')
+
+    if not image_ids_to_delete or not isinstance(image_ids_to_delete, list):
+        return jsonify({'error': 'Invalid request. "image_ids" must be a list.'}), 400
+
+    cur = None
+    try:
+        cur = mysql.connection.cursor()
+        
+        # To be safe, ensure all IDs are integers
+        image_ids_to_delete = [int(id) for id in image_ids_to_delete]
+        
+        # Create placeholders for the IN clause
+        placeholders = ','.join(['%s'] * len(image_ids_to_delete))
+        
+        # Delete from results first (child table)
+        sql_delete_results = f"DELETE FROM results WHERE image_id IN ({placeholders})"
+        cur.execute(sql_delete_results, image_ids_to_delete)
+        
+        # Delete from images (parent table)
+        sql_delete_images = f"DELETE FROM images WHERE id IN ({placeholders})"
+        cur.execute(sql_delete_images, image_ids_to_delete)
+        
+        mysql.connection.commit()
+        
+        # Optionally, delete the image files from the server
+        # This part is commented out as it requires fetching paths before deleting DB records.
+        # It's safer to have a separate cleanup script for orphaned files.
+        # for image_id in image_ids_to_delete:
+        #    ... find path and os.remove(path) ...
+
+        return jsonify({'message': f'Successfully deleted session with {len(image_ids_to_delete)} images.'}), 200
+
+    except Exception as e:
+        if cur:
+            mysql.connection.rollback()
+        print(f"Error in /history/delete endpoint: {e}")
+        return jsonify({'error': f'An unexpected error occurred: {str(e)}'}), 500
+    finally:
+        if cur:
+            cur.close()
+
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0')
+    app.run(debug=True, host='127.0.0.1')

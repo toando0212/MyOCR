@@ -1,7 +1,15 @@
 <resources xmlns:tools="http://schemas.android.com/tools">
     <!-- Base application theme. -->
-    <style name="Base.Theme.MyOCR" parent="Theme.Material3.DayNight.NoActionBar">
-        <!-- Customize your dark theme here. -->
-        <!-- <item name="colorPrimary">@color/my_dark_primary</item> -->
+    <style name="Base.Theme.MyOCR" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <!-- Override all main colors to green_700 for dark theme -->
+        <item name="colorPrimary">@color/green_700</item>
+        <item name="colorPrimaryVariant">@color/green_700</item>
+        <item name="colorOnPrimary">@color/white</item>
+        <item name="colorSecondary">@color/green_700</item>
+        <item name="colorOnSecondary">@color/black</item>
+        <item name="android:statusBarColor">@color/green_700</item>
+        <item name="colorAccent">@color/green_700</item>
+        <item name="colorSurface">@color/green_700</item>
+        <item name="colorPrimaryDark">@color/green_700</item>
     </style>
 </resources>

@@ -1,401 +1,252 @@
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 import gradio as gr
 import numpy as np
-import subprocess
-import json
 import os
 import cv2
 import torch
-from doctr.models import detection_predictor
+from doctr.models import ocr_predictor
 from doctr.io import DocumentFile
-from torchvision.transforms import Compose
 import logging
 import sys
 import math
 from vietocr.tool.predictor import Predictor
 from vietocr.tool.config import Cfg
+from pyvi import ViTokenizer
+from pipeline_utils import correct_perspective, deskew_image, remove_horizontal_lines
 
 # Set up logging to force output to console
 for handler in logging.root.handlers[:]:
     logging.root.removeHandler(handler)
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     stream=sys.stdout
 )
 logger = logging.getLogger(__name__)
 
-logger.info("Starting the OCR application...")
+logger.info("Starting the Unified OCR pipeline application...")
 
 try:
-    # Load VietOCR model
+    # Load VietOCR model for recognition
     logger.info("Loading VietOCR model (vgg_seq2seq)...")
-    # Configure VietOCR
-    config = Cfg.load_config_from_name('vgg_seq2seq')
-    # config = Cfg.load_config_from_name('vgg_transformer')
-    # Set device to CPU
-    config['device'] = 'cpu'
+    config = Cfg.load_config_from_name('vgg_transformer')
+    config['device'] = 'cpu' # Force CPU for compatibility
     config['predictor']['beamsearch'] = False
-    # Initialize the predictor
     vietocr_predictor = Predictor(config)
     logger.info("VietOCR model loaded successfully!")
+
+    # Load Doctr predictor for line detection only
+    # The recognition architecture is specified but won't be used because we call with detect_only=True
+    logger.info("Initializing DocTR predictor for line detection...")
+    doctr_predictor = ocr_predictor(det_arch='fast_small', pretrained=True)
+    logger.info("DocTR predictor loaded successfully!")
+
 except Exception as e:
-    logger.error(f"Error during model initialization: {str(e)}")
+    logger.error(f"Error during model initialization: {str(e)}", exc_info=True)
     raise
 
-def doctr_segment_lines(pil_img):
-    logger.info("Starting line segmentation...")
+def merge_boxes_to_lines(boxes: list, page_dims: tuple, tolerance_ratio: float = 0.7) -> list:
+    """
+    Merges bounding boxes into lines of text, which is crucial for handwriting.
+    
+    Args:
+        boxes: A list of bounding boxes, each defined as (xmin, ymin, xmax, ymax)
+               in relative coordinates (0 to 1).
+        page_dims: A tuple (height, width) of the page.
+        tolerance_ratio: The vertical tolerance for merging boxes into the same line,
+                         as a ratio of the box height.
+    
+    Returns:
+        A list of merged bounding boxes representing text lines in absolute coordinates.
+    """
+    if not boxes:
+        return []
+
+    page_height, page_width = page_dims
+    # Convert boxes to absolute coordinates and include their height for sorting
+    abs_boxes = [
+        (int(b[0] * page_width), int(b[1] * page_height), int(b[2] * page_width), int(b[3] * page_height))
+        for b in boxes
+    ]
+
+    # Sort boxes primarily by their vertical position, then horizontal
+    sorted_boxes = sorted(abs_boxes, key=lambda x: (x[1], x[0]))
+
+    merged_lines = []
+    if not sorted_boxes:
+        return []
+
+    current_line = list(sorted_boxes[0])
+
+    for i in range(1, len(sorted_boxes)):
+        box = sorted_boxes[i]
+        
+        current_line_height = current_line[3] - current_line[1]
+        current_line_y_center = current_line[1] + current_line_height / 2
+        
+        box_height = box[3] - box[1]
+        box_y_center = box[1] + box_height / 2
+
+        vertical_tolerance = min(current_line_height, box_height) * tolerance_ratio
+
+        # Check if the box y-center is within the vertical tolerance of the current line's y-center
+        if abs(box_y_center - current_line_y_center) <= vertical_tolerance:
+            # Merge box into current line by expanding the line's bounding box
+            current_line[0] = min(current_line[0], box[0])
+            current_line[1] = min(current_line[1], box[1])
+            current_line[2] = max(current_line[2], box[2])
+            current_line[3] = max(current_line[3], box[3])
+        else:
+            merged_lines.append(tuple(current_line))
+            current_line = list(box)
+
+    merged_lines.append(tuple(current_line))
+    
+    return merged_lines
+
+def post_process_text(text: str) -> str:
+    """
+    Correctly segments Vietnamese words using pyvi.
+    """
+    logger.info("Starting post-processing (Vietnamese word segmentation)...")
     try:
-        # Save temp image to file
-        temp_path = "temp_input_doctr.png"
-        pil_img.convert("RGB").save(temp_path)
-        
-        logger.info("Loading image with DocTR...")
-        doc = DocumentFile.from_images(temp_path)
-        
-        logger.info("Initializing DocTR detection model...")
-        det_model = detection_predictor(arch="db_mobilenet_v3_large", pretrained=True)
-        
-        logger.info("Running line detection...")
-        result = det_model(doc)
-        
-        logger.debug(f"Raw detection result from DocTR: {result}")
-        
-        if not result:
-            logger.warning("DocTR returned an empty result list.")
-            return []
-            
-        page = result[0]
-        if 'words' not in page or page['words'].shape[0] == 0:
-            logger.warning("DocTR detected 0 words on the page.")
-            return []
-
-        # Get absolute word boxes
-        img_width, img_height = pil_img.size
-        words = [
-            (
-                int(w[0] * img_width),
-                int(w[1] * img_height),
-                int(w[2] * img_width),
-                int(w[3] * img_height)
-            )
-            for w in page['words'][:, :-1]
-        ]
-
-        # Sort words by their vertical position, then horizontal
-        words.sort(key=lambda w: (w[1], w[0]))
-
-        lines_with_words = []
-        if not words:
-            return []
-
-        # Heuristic-based line reconstruction
-        current_line_words = [words[0]]
-        for box in words[1:]:
-            last_box = current_line_words[-1]
-            last_box_y_center = (last_box[1] + last_box[3]) / 2
-            current_box_y_center = (box[1] + box[3]) / 2
-            last_box_height = last_box[3] - last_box[1]
-
-            if abs(current_box_y_center - last_box_y_center) < last_box_height * 0.7:
-                current_line_words.append(box)
-            else:
-                min_x = min(b[0] for b in current_line_words)
-                min_y = min(b[1] for b in current_line_words)
-                max_x = max(b[2] for b in current_line_words)
-                max_y = max(b[3] for b in current_line_words)
-                lines_with_words.append(((min_x, min_y, max_x, max_y), sorted(current_line_words, key=lambda b: b[0])))
-                current_line_words = [box]
-        
-        if current_line_words:
-            min_x = min(b[0] for b in current_line_words)
-            min_y = min(b[1] for b in current_line_words)
-            max_x = max(b[2] for b in current_line_words)
-            max_y = max(b[3] for b in current_line_words)
-            lines_with_words.append(((min_x, min_y, max_x, max_y), sorted(current_line_words, key=lambda b: b[0])))
-
-        logger.info(f"Reconstructed {len(lines_with_words)} lines from {len(words)} words.")
-        
-        try:
-            os.remove(temp_path)
-        except Exception as e:
-            logger.warning(f"Failed to remove temporary file: {str(e)}")
-            
-        return lines_with_words
+        # Tokenize the text to add underscores between compound words
+        tokenized_text = ViTokenizer.tokenize(text)
+        # Replace underscores with spaces for better readability
+        readable_text = tokenized_text.replace('_', ' ')
+        logger.info("Post-processing completed.")
+        return readable_text
     except Exception as e:
-        logger.error(f"Error in line segmentation: {str(e)}", exc_info=True)
-        raise
+        logger.error(f"Error during post-processing: {e}", exc_info=True)
+        return text # Return original text on error
 
 @torch.no_grad()
-def recognize_lines_with_vietocr(pil_img, lines_with_words):
-    logger.info("Starting text recognition with VietOCR...")
-    try:
-        recognized_lines = []
-        
-        def recognize_chunk(crop_img):
-            if crop_img.width == 0 or crop_img.height == 0:
-                return ""
-            if np.array(crop_img).std() < 10:
-                return ""
-            return vietocr_predictor.predict(crop_img)
-
-        logger.info(f"Processing {len(lines_with_words)} lines.")
-        for i, (line_box, word_boxes) in enumerate(lines_with_words):
-            line_crop = pil_img.crop(line_box)
-            
-            line_width = line_box[2] - line_box[0]
-            line_height = line_box[3] - line_box[1]
-            aspect_ratio = line_width / line_height if line_height > 0 else 0
-            
-            logger.debug(f"Line {i+1} box: {line_box}, aspect ratio: {aspect_ratio:.2f}")
-
-            # "Divide and conquer" for long lines
-            if aspect_ratio > 15 and len(word_boxes) > 1:
-                logger.info(f"Line {i+1} is long (ratio: {aspect_ratio:.2f}). Processing in chunks.")
-                
-                line_text_parts = []
-                current_chunk_words = []
-                for idx, word_box in enumerate(word_boxes):
-                    current_chunk_words.append(word_box)
-                    
-                    chunk_x_min = min(b[0] for b in current_chunk_words)
-                    chunk_y_min = min(b[1] for b in current_chunk_words)
-                    chunk_x_max = max(b[2] for b in current_chunk_words)
-                    chunk_y_max = max(b[3] for b in current_chunk_words)
-                    
-                    chunk_width = chunk_x_max - chunk_x_min
-                    chunk_height = chunk_y_max - chunk_y_min
-                    chunk_aspect_ratio = chunk_width / chunk_height if chunk_height > 0 else 0
-
-                    if chunk_aspect_ratio > 8 or idx == len(word_boxes) - 1:
-                        chunk_crop = pil_img.crop((chunk_x_min, chunk_y_min, chunk_x_max, chunk_y_max))
-                        chunk_text = recognize_chunk(chunk_crop)
-                        if chunk_text:
-                            line_text_parts.append(chunk_text)
-                        current_chunk_words = []
-
-                full_line_text = " ".join(line_text_parts)
-                recognized_lines.append(full_line_text)
-                logger.debug(f"Reconstructed line {i+1}: {full_line_text}")
-
-            else: # Process as a single block
-                text = recognize_chunk(line_crop)
-                if text:
-                    recognized_lines.append(text)
-                    logger.debug(f"Recognized line {i+1}: {text}")
-                else:
-                    logger.debug(f"Skipping line {i+1} due to empty recognition result.")
-            
-        logger.info(f"Successfully recognized {len(recognized_lines)} lines")
-        return recognized_lines
-    except Exception as e:
-        logger.error(f"Error in text recognition: {str(e)}", exc_info=True)
-        raise
-
-def remove_horizontal_lines(pil_img):
-    try:
-        img = np.array(pil_img)
-        if img.ndim == 3:
-            img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-        if img.mean() > 127:
-            img = 255 - img
-        horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 1))
-        detected_lines = cv2.morphologyEx(img, cv2.MORPH_OPEN, horizontal_kernel, iterations=2)
-        img_no_lines = cv2.subtract(img, detected_lines)
-        img_no_lines = 255 - img_no_lines
-        return Image.fromarray(img_no_lines)
-    except Exception as e:
-        logger.error(f"Error in horizontal line removal: {str(e)}")
-        raise
-
-def correct_perspective(pil_img: Image.Image) -> Image.Image:
-    """
-    Corrects perspective distortion in an image of a document.
-    Finds the largest quadrilateral in the image and warps it to a top-down view.
-    This version includes a check to ensure the detected contour is large enough to be the document.
-    """
-    try:
-        img = np.array(pil_img.convert("RGB"))
-        orig = img.copy()
-        
-        # Downscale for faster processing, preserving aspect ratio
-        proc_height = 500.0
-        if img.shape[0] <= proc_height:
-             ratio = 1.0
-             proc_img = img.copy()
-        else:
-             ratio = img.shape[0] / proc_height
-             proc_img = cv2.resize(img, (int(img.shape[1] / ratio), int(proc_height)))
-
-        # Edge detection
-        gray = cv2.cvtColor(proc_img, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (5, 5), 0)
-        edged = cv2.Canny(gray, 75, 200)
-
-        # Find contours
-        contours, _ = cv2.findContours(edged.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:5]
-
-        screenCnt = None
-        img_area = proc_img.shape[0] * proc_img.shape[1]
-
-        for c in contours:
-            peri = cv2.arcLength(c, True)
-            approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-            
-            if len(approx) == 4:
-                if cv2.contourArea(approx) > img_area * 0.20: # Must be at least 20% of the image
-                    screenCnt = approx
-                    break
-                else:
-                    logger.info(f"Found a 4-point contour, but its area is too small. Skipping it.")
-        
-        if screenCnt is None:
-            logger.warning("Could not find a suitable document contour. Skipping perspective correction.")
-            return pil_img
-        
-        logger.info("Found document contour, applying perspective correction.")
-
-        # Order the points for the perspective transform
-        pts = screenCnt.reshape(4, 2) * ratio
-        rect = np.zeros((4, 2), dtype="float32")
-        s = pts.sum(axis=1)
-        rect[0] = pts[np.argmin(s)] # Top-left
-        rect[2] = pts[np.argmax(s)] # Bottom-right
-        diff = np.diff(pts, axis=1)
-        rect[1] = pts[np.argmin(diff)] # Top-right
-        rect[3] = pts[np.argmax(diff)] # Bottom-left
-        
-        (tl, tr, br, bl) = rect
-
-        widthA = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
-        widthB = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
-        maxWidth = max(int(widthA), int(widthB))
-
-        heightA = np.sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
-        heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
-        maxHeight = max(int(heightA), int(heightB))
-
-        if maxWidth <= 0 or maxHeight <= 0:
-            logger.warning("Calculated invalid dimensions for warped image. Skipping perspective correction.")
-            return pil_img
-
-        dst = np.array([
-            [0, 0],
-            [maxWidth - 1, 0],
-            [maxWidth - 1, maxHeight - 1],
-            [0, maxHeight - 1]], dtype="float32")
-
-        M = cv2.getPerspectiveTransform(rect, dst)
-        warped = cv2.warpPerspective(orig, M, (maxWidth, maxHeight))
-        return Image.fromarray(warped)
-    except Exception as e:
-        logger.error(f"Error during perspective correction: {e}", exc_info=True)
-        return pil_img
-
-def deskew_image(pil_img: Image.Image) -> Image.Image:
-    """Detects the skew angle of the text in the image and rotates it to be straight."""
-    try:
-        img = np.array(pil_img.convert("L"))
-        img_inverted = cv2.bitwise_not(img)
-        thresh = cv2.threshold(img_inverted, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
-        lines = cv2.HoughLinesP(thresh, 1, np.pi / 180, 100, minLineLength=100, maxLineGap=10)
-
-        if lines is None:
-            logger.warning("Deskew: No lines detected by Hough Transform, skipping rotation.")
-            return pil_img
-
-        angles = []
-        for line in lines:
-            x1, y1, x2, y2 = line[0]
-            angle = math.degrees(math.atan2(y2 - y1, x2 - x1))
-            angles.append(angle)
-
-        median_angle = np.median(angles)
-        logger.info(f"Detected skew angle via Hough Transform: {median_angle:.2f} degrees")
-
-        if abs(median_angle) < 1:
-            logger.info("Skew angle is insignificant, skipping rotation.")
-            return pil_img
-
-        (h, w) = img.shape[:2]
-        center = (w // 2, h // 2)
-        M = cv2.getRotationMatrix2D(center, median_angle, 1.0)
-        rotated = cv2.warpAffine(np.array(pil_img), M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-        return Image.fromarray(rotated)
-    except Exception as e:
-        logger.error(f"Error during image deskewing: {e}", exc_info=True)
-        return pil_img
-
 def ocr_pipeline(pil_img):
-    logger.info("OCR pipeline started for a new image.")
+    logger.info("OCR pipeline started.")
+    if pil_img is None:
+        # Return empty values for all outputs
+        return "Please upload an image.", "", None, None, None, None
+
     try:
-        if pil_img is None:
-            logger.warning("Input image is None, stopping pipeline.")
-            return "Please upload an image.", None, None, None
-            
-        logger.info("Correcting perspective...")
+        # Step 1: Preprocessing
+        logger.info("Step 1: Correcting perspective...")
         corrected_img = correct_perspective(pil_img)
 
-        logger.info("Deskewing image...")
+        logger.info("Step 2: Deskewing image...")
         deskewed_img = deskew_image(corrected_img)
         
-        logger.info("Removing horizontal lines...")
+        logger.info("Step 3: Removing horizontal lines...")
         processed_img_for_detection = remove_horizontal_lines(deskewed_img)
         
-        logger.info("Detecting lines...")
-        lines_with_words = doctr_segment_lines(processed_img_for_detection)
+        # Step 4: Line Detection using DocTR
+        logger.info("Step 4: Running DocTR to detect lines (recognition results will be replaced)...")
+        img_array = np.array(processed_img_for_detection.convert("RGB"))
         
-        if not lines_with_words:
-            logger.warning("No lines were detected by DocTR.")
-            return "No lines detected.", processed_img_for_detection, deskewed_img.copy().convert("RGB"), None
+        # Run full OCR with DocTR. We will use its detection results (bounding boxes)
+        # and then use VietOCR for the actual text recognition. This avoids the 'detect_only' error.
+        result = doctr_predictor([img_array])
+        
+        if not result.pages or not result.pages[0].blocks:
+            logger.warning("No text boxes detected by DocTR.")
+            # Return intermediate images for debugging
+            return "No text boxes detected.", "", corrected_img, deskewed_img, processed_img_for_detection, deskewed_img.copy().convert("RGB")
 
-        # Extract just the line boxes for visualization
-        line_boxes = [item[0] for item in lines_with_words]
+        # Step 4a: Extract all detected boxes from DocTR
+        logger.info("Step 4a: Extracting individual boxes from DocTR result...")
+        page = result.pages[0]
+        page_dims = page.dimensions # (height, width)
+        all_boxes = []
+        for block in page.blocks:
+            for line in block.lines:
+                all_boxes.append((line.geometry[0][0], line.geometry[0][1], line.geometry[1][0], line.geometry[1][1]))
 
-        logger.info("Recognizing text with VietOCR...")
-        recognized_lines = recognize_lines_with_vietocr(deskewed_img, lines_with_words)
+        # Step 4b: Merge boxes into lines
+        logger.info("Step 4b: Merging detected boxes into lines for handwriting...")
+        merged_line_boxes = merge_boxes_to_lines(all_boxes, page_dims)
+        if not merged_line_boxes:
+            logger.warning("Box merging resulted in no lines. OCR will be empty.")
+            return "Box merging failed to create any lines.", "", corrected_img, deskewed_img, processed_img_for_detection, deskewed_img.copy().convert("RGB")
+
+        # Step 5: Text Recognition using VietOCR on MERGED lines
+        logger.info("Step 5: Recognizing text with VietOCR on merged lines...")
+        recognized_results = []
         
-        logger.info("Creating visualization...")
-        line_img = deskewed_img.copy().convert("RGB")
-        draw_line = ImageDraw.Draw(line_img)
-        
-        for i, box in enumerate(line_boxes):
-            draw_line.rectangle([box[0], box[1], box[2], box[3]], outline="orange", width=2)
-            if i < len(recognized_lines):
-                text_position = (box[0], box[1] - 15 if box[1] > 15 else box[1])
-                draw_line.text(text_position, recognized_lines[i], fill="orange")
-        
-        mask = np.zeros((deskewed_img.height, deskewed_img.width), dtype=np.uint8)
-        for box in line_boxes:
-            y_min, y_max = int(box[1]), int(box[3])
-            x_min, x_max = int(box[0]), int(box[2])
-            mask[y_min:y_max, x_min:x_max] = 255
+        for line_box in merged_line_boxes:
+            # Crop the line from the clean, deskewed image for best recognition results
+            line_crop = deskewed_img.crop(line_box)
             
-        out_text = "\n".join([f"Line {i+1}: {t}" for i, t in enumerate(recognized_lines)])
+            # Recognize text using VietOCR
+            if line_crop.width > 0 and line_crop.height > 0:
+                try:
+                    line_text = vietocr_predictor.predict(line_crop)
+                except Exception as recog_e:
+                    logger.warning(f"VietOCR failed to recognize a line crop: {recog_e}")
+                    line_text = "" # Assign empty string on failure
+            else:
+                line_text = ""
+
+            if not line_text:
+                logger.debug("Skipping line due to empty recognition result.")
+                continue
+            
+            recognized_results.append({
+                'box': line_box, 
+                'text': line_text, 
+            })
+            logger.info(f"Recognized Line: {line_text}")
+        
+        # Step 6: Create visualization on the deskewed image
+        logger.info("Step 6: Creating visualization...")
+        vis_img = deskewed_img.copy().convert("RGB")
+        draw = ImageDraw.Draw(vis_img)
+        
+        for res in recognized_results:
+            box, text = res['box'], res['text']
+            draw.rectangle(box, outline="blue", width=2)
+            
+            # Position text above the bounding box
+            text_position = (box[0], box[1] - 15 if box[1] > 15 else box[1])
+            
+            try:
+                # Use a common font if available
+                font = ImageFont.truetype("arial.ttf", 15)
+            except IOError:
+                # Fallback to default font
+                font = ImageFont.load_default()
+                
+            draw.text(text_position, text, fill="blue", font=font)
+        
+        out_text = "\n".join([r['text'] for r in recognized_results])
         logger.info("OCR pipeline completed successfully.")
         
-        return out_text, processed_img_for_detection, line_img, Image.fromarray(mask)
+        # Step 7: Post-processing
+        post_processed_text = post_process_text(out_text)
+        
+        return out_text, post_processed_text, corrected_img, deskewed_img, processed_img_for_detection, vis_img
+
     except Exception as e:
         error_msg = f"Error in OCR pipeline: {str(e)}"
         logger.error(error_msg, exc_info=True)
-        return error_msg, None, pil_img, None
+        # Return original image in the last slot on error, and Nones for the rest
+        return error_msg, "", None, None, None, pil_img
 
 # Create Gradio interface
 demo = gr.Interface(
     fn=ocr_pipeline,
     inputs=gr.Image(type="pil", label="Upload Document Image"),
     outputs=[
-        gr.Textbox(label="Recognized Lines"),
-        gr.Image(type="pil", label="Preprocessed Image (for Detection)"),
-        gr.Image(type="pil", label="Line Bounding Boxes (DocTR)"),
-        gr.Image(type="pil", label="Line Mask (DocTR)")
+        gr.Textbox(label="1. Raw Recognized Text"),
+        gr.Textbox(label="2. Post-Processed Text (Word Segmented)"),
+        gr.Image(type="pil", label="3. Perspective Corrected"),
+        gr.Image(type="pil", label="4. Deskewed"),
+        gr.Image(type="pil", label="5. Preprocessed (Lines Removed)"),
+        gr.Image(type="pil", label="6. Final Result (Boxes on Deskewed Image)")
     ],
-    title="Unified Line-level OCR with DocTR Line Segmentation and VietOCR Recognition",
-    description="Detects lines using DocTR, recognizes each line with VietOCR, and visualizes detected line bounding boxes and mask."
+    title="Vietnamese OCR Pipeline: Preprocessing, Recognition, and Post-processing",
+    description="Shows the output of each step. 1. Perspective Correction -> 2. Rotational Deskew -> 3. Line Removal -> 4. Line Detection (DocTR) -> 4b. Box Merging -> 5. Recognition (VietOCR) -> 6. Post-processing (Word Segmentation)."
 )
 
 if __name__ == "__main__":
     logger.info("Starting Gradio interface...")
     demo.launch(debug=True, server_name="0.0.0.0", server_port=7862)
-    logger.info("Gradio interface running at http://0.0.0.0:7861") 
+    logger.info("Gradio interface running at http://0.0.0.0:7862") 

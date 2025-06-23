@@ -1,210 +1,189 @@
 package com.example.myocr;
 
 import android.content.Intent;
-import android.os.AsyncTask;
+import android.content.SharedPreferences;
 import android.os.Bundle;
-import android.text.TextUtils;
 import android.view.View;
 import android.widget.Button;
-import android.widget.EditText;
 import android.widget.TextView;
+import android.widget.Toast;
+
+import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
-import android.app.AlertDialog;
+
+import com.google.android.material.snackbar.Snackbar;
+import com.google.android.material.textfield.TextInputEditText;
+import com.google.android.material.textfield.TextInputLayout;
+
+import org.json.JSONException;
 import org.json.JSONObject;
-import java.io.OutputStream;
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
-import java.net.HttpURLConnection;
-import java.net.URL;
+
+import java.io.IOException;
+
+import okhttp3.Call;
+import okhttp3.Callback;
+import okhttp3.MediaType;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.RequestBody;
+import okhttp3.Response;
 
 public class LoginActivity extends AppCompatActivity {
-    private EditText etUsername, etPassword, etConfirmPassword;
-    private TextView tvError, tvToggleMode;
+
+    private TextInputEditText etUsername, etPassword, etConfirmPassword;
+    private TextInputLayout tilUsername, tilPassword, tilConfirmPassword;
     private Button btnAuth, btnGuest;
+    private TextView tvToggleMode;
     private boolean isLoginMode = true;
+    private final OkHttpClient client = new OkHttpClient();
+    private static final String BASE_URL = "https://7c2c-2405-4803-f801-12a0-1883-6ffe-89a4-5660.ngrok-free.app"; // IMPORTANT: Use your actual server URL
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_login);
 
+        // Initialize views
         etUsername = findViewById(R.id.etUsername);
         etPassword = findViewById(R.id.etPassword);
         etConfirmPassword = findViewById(R.id.etConfirmPassword);
-        tvError = findViewById(R.id.tvError);
+        tilUsername = findViewById(R.id.tilUsername);
+        tilPassword = findViewById(R.id.tilPassword);
+        tilConfirmPassword = findViewById(R.id.tilConfirmPassword);
         btnAuth = findViewById(R.id.btnAuth);
-        tvToggleMode = findViewById(R.id.tvToggleMode);
         btnGuest = findViewById(R.id.btnGuest);
+        tvToggleMode = findViewById(R.id.tvToggleMode);
 
-        updateMode();
+        updateUIForMode();
+
+        tvToggleMode.setOnClickListener(v -> {
+            isLoginMode = !isLoginMode;
+            updateUIForMode();
+        });
 
         btnAuth.setOnClickListener(v -> {
             String username = etUsername.getText().toString().trim();
             String password = etPassword.getText().toString().trim();
-            if (username.length() < 4) {
-                showError("Username must be at least 4 characters");
-                return;
-            }
-            if (password.length() < 6) {
-                showError("Password must be at least 6 characters");
-                return;
-            }
-            if (isLoginMode) {
-                new LoginTask().execute(username, password);
-            } else {
-                String confirmPassword = etConfirmPassword.getText().toString().trim();
-                if (!password.equals(confirmPassword)) {
-                    showError("Passwords do not match");
-                    return;
-                }
-                new RegisterTask().execute(username, password);
-            }
-        });
+            String confirmPassword = etConfirmPassword.getText().toString().trim();
 
-        tvToggleMode.setOnClickListener(v -> {
-            isLoginMode = !isLoginMode;
-            updateMode();
+            // Basic validation
+            if (username.isEmpty() || password.isEmpty()) {
+                showSnackbar("Username and password cannot be empty.");
+                return;
+            }
+            if (!isLoginMode && !password.equals(confirmPassword)) {
+                showSnackbar("Passwords do not match.");
+                return;
+            }
+
+            setLoading(true);
+            if (isLoginMode) {
+                authenticateUser("/login", username, password);
+            } else {
+                authenticateUser("/register", username, password);
+            }
         });
 
         btnGuest.setOnClickListener(v -> {
-            // Navigate to MainActivity as a guest
-            Intent intent = new Intent(LoginActivity.this, MainActivity.class);
-            startActivity(intent);
-            finish();
+            SharedPreferences prefs = getSharedPreferences("user_prefs", MODE_PRIVATE);
+            prefs.edit().clear().apply(); // Clear all user data for guest mode
+            navigateToMain();
         });
     }
 
-    private class RegisterTask extends AsyncTask<String, Void, String> {
-        @Override
-        protected String doInBackground(String... params) {
-            String username = params[0];
-            String password = params[1];
-            try {
-                URL url = new URL("https://3e8f-42-114-227-240.ngrok-free.app/register");
-                HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-                conn.setRequestMethod("POST");
-                conn.setRequestProperty("Content-Type", "application/json; utf-8");
-                conn.setRequestProperty("Accept", "application/json");
-                conn.setDoOutput(true);
-                JSONObject jsonInput = new JSONObject();
-                jsonInput.put("username", username);
-                jsonInput.put("password", password);
-                try(OutputStream os = conn.getOutputStream()) {
-                    byte[] input = jsonInput.toString().getBytes("utf-8");
-                    os.write(input, 0, input.length);
-                }
-                int code = conn.getResponseCode();
-                BufferedReader br = new BufferedReader(new InputStreamReader(
-                        code >= 400 ? conn.getErrorStream() : conn.getInputStream(), "utf-8"));
-                StringBuilder response = new StringBuilder();
-                String responseLine;
-                while ((responseLine = br.readLine()) != null) {
-                    response.append(responseLine.trim());
-                }
-                return code + ":" + response.toString();
-            } catch (Exception e) {
-                return "error:" + e.getMessage();
-            }
+    private void authenticateUser(String endpoint, String username, String password) {
+        MediaType JSON = MediaType.get("application/json; charset=utf-8");
+        JSONObject jsonObject = new JSONObject();
+        try {
+            jsonObject.put("username", username);
+            jsonObject.put("password", password);
+        } catch (JSONException e) {
+            e.printStackTrace();
+            setLoading(false);
+            return;
         }
-        @Override
-        protected void onPostExecute(String result) {
-            if (result.startsWith("error:")) {
-                showError("Network error: " + result.substring(6));
-                return;
+
+        RequestBody body = RequestBody.create(jsonObject.toString(), JSON);
+        Request request = new Request.Builder()
+                .url(BASE_URL + endpoint)
+                .post(body)
+                .build();
+
+        client.newCall(request).enqueue(new Callback() {
+            @Override
+            public void onFailure(@NonNull Call call, @NonNull IOException e) {
+                runOnUiThread(() -> {
+                    setLoading(false);
+                    showSnackbar("Network error: " + e.getMessage());
+                });
             }
-            String[] parts = result.split(":", 2);
-            int code = Integer.parseInt(parts[0]);
-            String body = parts.length > 1 ? parts[1] : "";
-            if (code == 201) {
-                new AlertDialog.Builder(LoginActivity.this)
-                        .setTitle("Success")
-                        .setMessage("Registration successful! You can now log in.")
-                        .setPositiveButton("OK", null)
-                        .show();
-                tvError.setVisibility(View.GONE);
-            } else {
-                try {
-                    JSONObject obj = new JSONObject(body);
-                    showError(obj.optString("error", "Registration failed"));
-                } catch (Exception e) {
-                    showError("Registration failed");
-                }
+
+            @Override
+            public void onResponse(@NonNull Call call, @NonNull Response response) throws IOException {
+                final String responseBody = response.body().string();
+                runOnUiThread(() -> {
+                    setLoading(false);
+                    try {
+                        JSONObject json = new JSONObject(responseBody);
+                        if (response.isSuccessful()) {
+                            if (endpoint.equals("/login")) {
+                                int userId = json.getInt("user_id");
+                                saveUserSession(userId);
+                                showSnackbar("Login successful!");
+                                navigateToMain();
+                            } else { // Registration
+                                showSnackbar("Registration successful! Please log in.");
+                                isLoginMode = true;
+                                updateUIForMode();
+                            }
+                        } else {
+                            String error = json.optString("error", "An unknown error occurred.");
+                            showSnackbar(error);
+                        }
+                    } catch (JSONException e) {
+                        showSnackbar("Failed to parse server response.");
+                    }
+                });
             }
-        }
+        });
     }
 
-    private class LoginTask extends AsyncTask<String, Void, String> {
-        @Override
-        protected String doInBackground(String... params) {
-            String username = params[0];
-            String password = params[1];
-            try {
-                URL url = new URL("https://3e8f-42-114-227-240.ngrok-free.app/login");
-                HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-                conn.setRequestMethod("POST");
-                conn.setRequestProperty("Content-Type", "application/json; utf-8");
-                conn.setRequestProperty("Accept", "application/json");
-                conn.setDoOutput(true);
-                JSONObject jsonInput = new JSONObject();
-                jsonInput.put("username", username);
-                jsonInput.put("password", password);
-                try(OutputStream os = conn.getOutputStream()) {
-                    byte[] input = jsonInput.toString().getBytes("utf-8");
-                    os.write(input, 0, input.length);
-                }
-                int code = conn.getResponseCode();
-                BufferedReader br = new BufferedReader(new InputStreamReader(
-                        code >= 400 ? conn.getErrorStream() : conn.getInputStream(), "utf-8"));
-                StringBuilder response = new StringBuilder();
-                String responseLine;
-                while ((responseLine = br.readLine()) != null) {
-                    response.append(responseLine.trim());
-                }
-                return code + ":" + response.toString();
-            } catch (Exception e) {
-                return "error:" + e.getMessage();
-            }
-        }
-        @Override
-        protected void onPostExecute(String result) {
-            if (result.startsWith("error:")) {
-                showError("Network error: " + result.substring(6));
-                return;
-            }
-            String[] parts = result.split(":", 2);
-            int code = Integer.parseInt(parts[0]);
-            String body = parts.length > 1 ? parts[1] : "";
-            if (code == 200) {
-                // Login success, go to MainActivity
-                Intent intent = new Intent(LoginActivity.this, MainActivity.class);
-                startActivity(intent);
-                finish();
-            } else {
-                try {
-                    JSONObject obj = new JSONObject(body);
-                    showError(obj.optString("error", "Login failed"));
-                } catch (Exception e) {
-                    showError("Login failed");
-                }
-            }
-        }
+    private void saveUserSession(int userId) {
+        SharedPreferences prefs = getSharedPreferences("user_prefs", MODE_PRIVATE);
+        prefs.edit()
+                .putBoolean("isLoggedIn", true)
+                .putInt("userId", userId)
+                .apply();
     }
 
-    private void showError(String msg) {
-        tvError.setText(msg);
-        tvError.setVisibility(View.VISIBLE);
-    }
-
-    private void updateMode() {
+    private void updateUIForMode() {
         if (isLoginMode) {
-            etConfirmPassword.setVisibility(View.GONE);
-            btnAuth.setText("Login");
+            tilConfirmPassword.setVisibility(View.GONE);
+            btnAuth.setText(R.string.login);
             tvToggleMode.setText("Don't have an account? Register");
         } else {
-            etConfirmPassword.setVisibility(View.VISIBLE);
+            tilConfirmPassword.setVisibility(View.VISIBLE);
             btnAuth.setText("Register");
             tvToggleMode.setText("Already have an account? Login");
         }
-        tvError.setVisibility(View.GONE);
+        tilUsername.setError(null);
+        tilPassword.setError(null);
+        tilConfirmPassword.setError(null);
+    }
+
+    private void setLoading(boolean isLoading) {
+        btnAuth.setEnabled(!isLoading);
+        btnGuest.setEnabled(!isLoading);
+        btnAuth.setText(isLoading ? "Loading..." : (isLoginMode ? "Login" : "Register"));
+    }
+
+    private void showSnackbar(String message) {
+        Snackbar.make(findViewById(android.R.id.content), message, Snackbar.LENGTH_LONG).show();
+    }
+
+    private void navigateToMain() {
+        Intent intent = new Intent(LoginActivity.this, MainActivity.class);
+        startActivity(intent);
+        finish();
     }
 } 

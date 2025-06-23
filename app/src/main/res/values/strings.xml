@@ -46,4 +46,55 @@
         libero vel nunc consequat, quis tincidunt nisl eleifend. Cras bibendum enim a justo luctus
         vestibulum. Fusce dictum libero quis erat maximus, vitae volutpat diam dignissim.
     </string>
+    <string name="select_document_language">Select document language:</string>
+    <string name="vietnamese">Vietnamese</string>
+    <string name="english">English</string>
+    <string name="run_ocr">Run OCR</string>
+    <string name="export">Export to PDF or DOCX</string>
+    <string name="history">History</string>
+    <string name="choose_image_source">Choose image source</string>
+    <string name="take_photo">Take photo</string>
+    <string name="upload_from_device">Upload from device</string>
+    <string name="please_select_image">Please select an image first.</string>
+    <string name="no_text_recognized">No text recognized.</string>
+    <string name="export_file">Export file</string>
+    <string name="export_coming_soon">Export to PDF/DOCX feature coming soon.</string>
+    <string name="ok">OK</string>
+    <string name="history_selected">History selected</string>
+    <string name="permission_denied">Permission denied to read external storage</string>
+    <string name="ocr_failed">OCR failed: %1$s</string>
+    <string name="ocr_request_failed">OCR Request failed: %1$s</string>
+    <string name="failed_to_parse_ocr_result">Failed to parse OCR result</string>
+    <string name="failed_to_process_image">Failed to process image: %1$s</string>
+    <string name="cannot_open_image">Cannot open image</string>
+    <string name="edit_image">Chỉnh sửa ảnh</string>
+    <string name="processing">Processing...</string>
+    <string name="login">Login</string>
+    <string name="continue_as_guest">Continue as Guest</string>
+    <string name="login_required_for_history">Please log in to use this feature.</string>
+    <string name="no_history_found">No history found.</string>
+    <string name="image_count">%d images</string>
+    <string name="new_ocr_session">New OCR Session</string>
+    <string name="delete_image_title">Delete Image</string>
+    <string name="delete_image_confirmation">Are you sure you want to delete this image?</string>
+    <string name="delete">Delete</string>
+    <string name="cancel">Cancel</string>
+    <string name="title_activity_login">LoginActivity</string>
+    <string name="prompt_email">Email</string>
+    <string name="prompt_password">Password</string>
+    <string name="action_sign_in">Sign in or register</string>
+    <string name="nav_header_subtitle">android.studio@android.com</string>
+    <string name="nav_header_desc">Navigation header</string>
+    <string name="login_to_view_history">Login to view history</string>
+    <string name="delete_confirmation">Delete Confirmation</string>
+    <string name="are_you_sure_delete_image">Are you sure you want to delete this image?</string>
+    <string name="yes">Yes</string>
+    <string name="no">No</string>
+    <string name="delete_session">Delete Session</string>
+    <string name="delete_session_confirmation_title">Confirm Deletion</string>
+    <string name="delete_session_confirmation_message">Are you sure you want to permanently delete this session?</string>
+    <string name="stop_ocr">Stop OCR</string>
+    <string name="stop_ocr_title">Stop Process</string>
+    <string name="stop_ocr_confirmation">Are you sure you want to stop the OCR process?</string>
+    <string name="ocr_stopped_message">OCR process stopped.</string>
 </resources>
