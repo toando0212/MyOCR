@@ -55,31 +55,48 @@ public class OcrResultAdapter extends RecyclerView.Adapter<OcrResultAdapter.View
         } else {
             holder.progressBar.setVisibility(View.GONE);
             holder.tvOcrResult.setVisibility(View.VISIBLE);
-            holder.tvOcrResult.setText(result.getText());
+            
+            if (result.getError() != null) {
+                // Handle error case
+                holder.tvOcrResult.setText(result.getError());
+                holder.tvOcrResult.setTextColor(ContextCompat.getColor(context, android.R.color.holo_red_dark));
+                holder.ivPreview.setVisibility(View.GONE);
 
-            Bitmap previewBitmap = result.getPreviewWithBoxes();
-            if (previewBitmap != null) {
-                holder.ivPreview.setVisibility(View.VISIBLE);
-                holder.ivPreview.setImageBitmap(previewBitmap);
-                holder.ivPreview.setOnClickListener(v -> {
-                    // Save bitmap to a temp file and pass the URI to the new activity
-                    try {
-                        File cachePath = new File(context.getCacheDir(), "images");
-                        cachePath.mkdirs();
-                        File tempFile = new File(cachePath, "image_preview.png");
-                        FileOutputStream stream = new FileOutputStream(tempFile);
-                        previewBitmap.compress(Bitmap.CompressFormat.PNG, 100, stream);
-                        stream.close();
+            } else if (result.getPage() != null) {
+                // Handle success case with a valid Page object
+                Page page = result.getPage();
+                holder.tvOcrResult.setText(page.getContent());
+                holder.tvOcrResult.setTextColor(ContextCompat.getColor(context, android.R.color.black)); // Reset color
+                
+                Bitmap previewBitmap = page.getPreviewImage();
+                if (previewBitmap != null) {
+                    holder.ivPreview.setVisibility(View.VISIBLE);
+                    holder.ivPreview.setImageBitmap(previewBitmap);
+                    holder.ivPreview.setOnClickListener(v -> {
+                        // Save bitmap to a temp file and pass the URI to the new activity
+                        try {
+                            File cachePath = new File(context.getCacheDir(), "images");
+                            cachePath.mkdirs();
+                            File tempFile = new File(cachePath, "image_preview_" + position + ".png");
+                            FileOutputStream stream = new FileOutputStream(tempFile);
+                            previewBitmap.compress(Bitmap.CompressFormat.PNG, 100, stream);
+                            stream.close();
 
-                        Intent intent = new Intent(context, ResultViewerActivity.class);
-                        intent.putExtra("image_uri", Uri.fromFile(tempFile).toString());
-                        context.startActivity(intent);
+                            Intent intent = new Intent(context, ResultViewerActivity.class);
+                            intent.putExtra("image_uri", Uri.fromFile(tempFile).toString());
+                            intent.putExtra("ocr_text", page.getContent());
+                            context.startActivity(intent);
 
-                    } catch (IOException e) {
-                        e.printStackTrace();
-                    }
-                });
+                        } catch (IOException e) {
+                            e.printStackTrace();
+                        }
+                    });
+                } else {
+                    holder.ivPreview.setVisibility(View.GONE);
+                }
             } else {
+                // Handle case where processing is done but page is null and no error
+                holder.tvOcrResult.setText("No result available.");
                 holder.ivPreview.setVisibility(View.GONE);
             }
         }

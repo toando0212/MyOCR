@@ -51,6 +51,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.Map;
 import java.util.Collections;
+import java.util.stream.Collectors;
+import java.util.HashMap;
 
 import okhttp3.*;
 import org.json.JSONArray;
@@ -96,9 +98,13 @@ import org.opencv.core.CvType;
 import org.opencv.core.Scalar;
 import org.opencv.core.Rect;
 
+import smile.clustering.HierarchicalClustering;
+import smile.clustering.linkage.WardLinkage;
+
 public class MainActivity extends AppCompatActivity implements ImageAdapter.OnImageClickListener, HistoryAdapter.OnHistorySessionInteractionListener {
     private static final int REQUEST_CAMERA_PERMISSION = 100;
     private static final int REQUEST_WRITE_STORAGE_PERMISSION = 102; // For export
+    private static final int REQUEST_CODE_CREATE_PDF = 2001;
     private RecyclerView imageRecyclerView;
     private ImageAdapter imageAdapter;
     private List<Uri> imageUris = new ArrayList<>();
@@ -148,6 +154,8 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
             .readTimeout(60, TimeUnit.SECONDS)
             .build();
     private static final String BASE_URL = "https://7c2c-2405-4803-f801-12a0-1883-6ffe-89a4-5660.ngrok-free.app"; // IMPORTANT: Use your actual server URL
+
+    private Uri pendingExportPdfUri = null;
 
     static {
         if(OpenCVLoader.initDebug()){
@@ -390,10 +398,11 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
     }
 
     private void openGallery() {
-        Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
         intent.setType("image/*");
         intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
-        pickImageLauncher.launch(Intent.createChooser(intent, "Select Pictures"));
+        pickImageLauncher.launch(Intent.createChooser(intent, "Select Image Source"));
     }
 
     @Override
@@ -456,7 +465,7 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
         stopOcrRequested = false;
         ocrResultList.clear();
         for (Uri uri : imageUris) {
-            ocrResultList.add(new OcrResult(uri, "Processing...", true));
+            ocrResultList.add(new OcrResult(uri, true));
         }
         ocrResultAdapter.notifyDataSetChanged();
         
@@ -486,140 +495,146 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
     
     private void performOcrForImage(Uri imageUri, final int position) {
         new Thread(() -> {
+            Page resultPage = null;
             try {
-                // 1. Load the original bitmap
+                // 1. Load and pre-process the original bitmap
                 Bitmap originalBitmap = BitmapFactory.decodeStream(getContentResolver().openInputStream(imageUri));
                 Mat originalMat = new Mat();
                 Utils.bitmapToMat(originalBitmap, originalMat);
-                
-                // --- NEW FEATURE: Pre-processing step to remove horizontal lines ---
                 removeHorizontalLines(originalMat);
-                // The rest of the pipeline will use the cleaned image.
                 Bitmap cleanedBitmap = Bitmap.createBitmap(originalMat.cols(), originalMat.rows(), Bitmap.Config.ARGB_8888);
                 Utils.matToBitmap(originalMat, cleanedBitmap);
 
-                // Important: work with RGB, not BGR
-                Imgproc.cvtColor(originalMat, originalMat, Imgproc.COLOR_RGBA2RGB);
+                // 2. Run Detection to get word boxes
+                List<RotatedRect> detectionBoxes = runDetection(cleanedBitmap);
+                Log.d("OcrDebugging", "Found " + detectionBoxes.size() + " boxes in detection phase.");
 
-                // 2. Run Detection to get ROTATED bounding boxes
-                List<RotatedRect> boxes = runDetection(cleanedBitmap);
-                Log.d("OcrDebugging", "Found " + boxes.size() + " boxes in detection phase.");
+                // 3. Group detected boxes into lines (still using WordBox for geometry grouping)
+                List<List<WordBox>> lineWordBoxes = resolveLines(detectionBoxes);
 
-                // --- START: Draw Bounding Boxes for Preview ---
-                Bitmap previewBitmap = cleanedBitmap.copy(Bitmap.Config.ARGB_8888, true);
-                Mat previewMat = new Mat();
-                Utils.bitmapToMat(previewBitmap, previewMat);
-
-                for (RotatedRect box : boxes) {
-                    Point[] vertices = new Point[4];
-                    box.points(vertices);
-                    MatOfPoint points = new MatOfPoint(vertices);
-                    Imgproc.polylines(previewMat, Collections.singletonList(points), true, new Scalar(0, 255, 0), 2); // Green boxes
-                }
-                Utils.matToBitmap(previewMat, previewBitmap);
-                // --- END: Draw Bounding Boxes for Preview ---
-
-                // Sort boxes from top to bottom, left to right for sequential reading
-                boxes.sort(Comparator.comparingDouble((RotatedRect rect) -> rect.center.y)
-                                   .thenComparingDouble(rect -> rect.center.x));
-
-                StringBuilder resultText = new StringBuilder();
+                // 4. Initialize session and models
                 OrtSession sessionToUse;
                 Vocab vocabToUse;
                 String selectedLang = radioVietnamese.isChecked() ? "vi" : "en";
-
-                if ("vi".equals(selectedLang)) {
+                if ("vi".equals(selectedLang) && ortSession != null && vietnameseVocab != null) {
                     sessionToUse = ortSession;
                     vocabToUse = vietnameseVocab;
-                    if(vocabToUse == null) {
-                        runOnUiThread(() -> Toast.makeText(MainActivity.this, "Vietnamese model not available.", Toast.LENGTH_SHORT).show());
-                        updateOcrResult(position, "Error: Vietnamese model not available.", false, null);
-                        triggerNextImageProcessing();
-                        return;
-                    }
                 } else {
                     sessionToUse = englishRecognitionSession;
                     vocabToUse = englishVocab;
                 }
-
-                if(sessionToUse == null || vocabToUse == null) {
+                if (sessionToUse == null || vocabToUse == null) {
                     throw new IOException("Models or vocabulary for the selected language are not loaded.");
                 }
 
-                // We will draw the boxes and also perform recognition in this loop
-                // The original image Mat is needed for cropping
+                // 5. Sequentially recognize words line by line and build data objects
                 Mat originalMatForCropping = new Mat();
                 Utils.bitmapToMat(cleanedBitmap, originalMatForCropping);
+                List<Line> resolvedLines = new ArrayList<>();
 
-                List<String> recognizedTexts = new ArrayList<>();
-                for (RotatedRect box : boxes) {
-                    // --- START: Safety Check & Clamp Bounding Box ---
-                    // Get the upright bounding box of the rotated rect
-                    Rect uprightBox = box.boundingRect();
+                for (List<WordBox> wordBoxLine : lineWordBoxes) {
+                    List<Word> wordsInLine = new ArrayList<>();
+                    for (WordBox wordBox : wordBoxLine) {
+                        // --- Recognition logic for each word ---
+                        Rect uprightBox = wordBox.box.boundingRect();
+                        int x = Math.max(0, uprightBox.x);
+                        int y = Math.max(0, uprightBox.y);
+                        int width = Math.min(originalMatForCropping.cols() - x, uprightBox.width);
+                        int height = Math.min(originalMatForCropping.rows() - y, uprightBox.height);
 
-                    // Intersect the box with the image boundaries to clamp it.
-                    // This prevents cropping outside the originalMat, which causes a crash.
-                    int x = Math.max(0, uprightBox.x);
-                    int y = Math.max(0, uprightBox.y);
-                    int width = Math.min(originalMatForCropping.cols() - x, uprightBox.width);
-                    int height = Math.min(originalMatForCropping.rows() - y, uprightBox.height);
+                        if (width <= 1 || height <= 1) continue;
 
-                    // If the clamped box has no area, it's invalid. Skip it.
-                    if (width <= 1 || height <= 1) {
-                        continue;
+                        Rect clampedBox = new Rect(x, y, width, height);
+                        Mat croppedMat = new Mat(originalMatForCropping, clampedBox);
+                        Bitmap croppedBitmap = Bitmap.createBitmap(croppedMat.cols(), croppedMat.rows(), Bitmap.Config.ARGB_8888);
+                        Utils.matToBitmap(croppedMat, croppedBitmap);
+
+                        FloatBuffer recInputBuffer = preprocessImageForRecognition(croppedBitmap);
+                        long[] recShape = {1, 3, 32, 128};
+
+                        String recognizedText = "";
+                        double confidence = 0.0; // Placeholder
+
+                        try (OnnxTensor recInputTensor = OnnxTensor.createTensor(ortEnv, recInputBuffer, recShape)) {
+                            OrtSession.Result recResult = sessionToUse.run(Collections.singletonMap("input", recInputTensor));
+                            float[][][] recOutput = (float[][][]) recResult.get(0).getValue();
+                            recognizedText = vocabToUse.decode(recOutput);
+                            // TODO: Extract confidence from recOutput if possible
+                            confidence = 0.95; // Using a placeholder for now
+                        }
+                        
+                        wordsInLine.add(new Word(recognizedText, confidence, wordBox.box));
+
+                        croppedMat.release();
+                        croppedBitmap.recycle();
                     }
-                    Rect clampedBox = new Rect(x, y, width, height);
-                    // --- END: Safety Check & Clamp Bounding Box ---
 
-                    // Crop the original image using the SAFE, clamped bounding box
-                    Mat croppedMat = new Mat(originalMatForCropping, clampedBox);
-
-                    // --- RECOGNITION PART ---
-                    // Now that we have a safe cropped Mat, proceed with recognition.
-                    // The existing code for recognition expects a Bitmap.
-                    Bitmap croppedBitmap = Bitmap.createBitmap(croppedMat.cols(), croppedMat.rows(), Bitmap.Config.ARGB_8888);
-                    Utils.matToBitmap(croppedMat, croppedBitmap);
-
-                    // The recognition model expects a specific input size (e.g., 32x128)
-                    // The preprocessImageForRecognition function handles resizing and padding.
-                    FloatBuffer recInputBuffer = preprocessImageForRecognition(croppedBitmap);
-                    long[] recShape = {1, 3, 32, 128}; // IMPORTANT: Adjust if your recognition model has a different input shape
-
-                    try (OnnxTensor recInputTensor = OnnxTensor.createTensor(ortEnv, recInputBuffer, recShape)) {
-                        OrtSession.Result recResult = sessionToUse.run(Collections.singletonMap("input", recInputTensor));
-                        float[][][] recOutput = (float[][][]) recResult.get(0).getValue();
-                        String recognizedText = vocabToUse.decode(recOutput);
-                        recognizedTexts.add(recognizedText);
-                        recResult.close(); // Release result resources
-                    } catch (Exception e) {
-                        Log.e("MainActivity", "Error during recognition for a box", e);
+                    if (!wordsInLine.isEmpty()) {
+                        RotatedRect lineGeometry = getEnclosingLineBox(wordBoxLine);
+                        resolvedLines.add(new Line(wordsInLine, lineGeometry));
                     }
-                    // Release memory
-                    croppedMat.release();
-                    croppedBitmap.recycle();
                 }
+                originalMatForCropping.release();
 
-                // --- END: Recognition Loop ---
+                // 6. Group resolved lines into blocks
+                List<Block> resolvedBlocks = resolveBlocks(resolvedLines);
 
-                // After the loop, join all recognized texts
-                String finalOcrText = String.join(" ", recognizedTexts);
-
-                // Update the UI
-                final int finalPosition = position;
-                Bitmap finalPreviewBitmap = previewBitmap.copy(previewBitmap.getConfig(), false);
-                runOnUiThread(() -> {
-                    updateOcrResult(finalPosition, finalOcrText, false, finalPreviewBitmap);
-                    triggerNextImageProcessing();
-                });
+                // 7. Create the final Page object
+                Bitmap finalPreviewBitmap = createPreviewWithBlocks(originalBitmap, resolvedBlocks);
+                resultPage = new Page(resolvedBlocks, position, originalBitmap.getWidth(), originalBitmap.getHeight(), finalPreviewBitmap);
 
             } catch (Exception e) {
                 Log.e("MainActivity", "Error during OCR for image " + position, e);
-                runOnUiThread(() -> {
-                    updateOcrResult(position, "Error: " + e.getMessage(), false, null);
-                    triggerNextImageProcessing();
-                });
+                // In case of error, create a placeholder Page object to pass to the UI
+                List<Block> errorBlock = new ArrayList<>();
+                errorBlock.add(new Block(new ArrayList<>(), new RotatedRect()));
+                resultPage = new Page(errorBlock, position, 0, 0, null);
+                // We'll handle the text update in updateOcrResult
             }
+
+            // 8. Update UI with the final Page object
+            final Page finalResultPage = resultPage;
+            final String errorMessage = (resultPage.getBlocks().isEmpty() || resultPage.getBlocks().get(0).getLines().isEmpty())
+                ? "Error during OCR process." : null;
+            
+            runOnUiThread(() -> {
+                if(errorMessage != null){
+                     updateOcrResult(position, errorMessage, false, null);
+                } else {
+                     updateOcrResult(position, finalResultPage, false);
+                }
+                triggerNextImageProcessing();
+            });
+
         }).start();
+    }
+
+    private Bitmap createPreviewWithBlocks(Bitmap sourceBitmap, List<Block> blocks) {
+        Bitmap previewBitmap = sourceBitmap.copy(Bitmap.Config.ARGB_8888, true);
+        Mat previewMat = new Mat();
+        Utils.bitmapToMat(previewBitmap, previewMat);
+
+        for (Block block : blocks) {
+            // Draw block bounding box in RED
+            RotatedRect blockBox = block.getGeometry();
+            Point[] blockVertices = new Point[4];
+            blockBox.points(blockVertices);
+            MatOfPoint blockPoints = new MatOfPoint(blockVertices);
+            Imgproc.polylines(previewMat, Collections.singletonList(blockPoints), true, new Scalar(255, 0, 0), 3); // Red for blocks
+            blockPoints.release();
+
+            // Draw lines in GREEN
+            for(Line line : block.getLines()){
+                RotatedRect lineBox = line.getGeometry();
+                Point[] lineVertices = new Point[4];
+                lineBox.points(lineVertices);
+                MatOfPoint linePoints = new MatOfPoint(lineVertices);
+                Imgproc.polylines(previewMat, Collections.singletonList(linePoints), true, new Scalar(0, 255, 0), 2); // Green for lines
+                linePoints.release();
+            }
+        }
+        Utils.matToBitmap(previewMat, previewBitmap);
+        return previewBitmap;
     }
 
     private void removeHorizontalLines(Mat image) {
@@ -820,60 +835,167 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
         return validBoxes;
     }
 
-    private List<RectF> groupBoundingBoxesIntoLines(List<RectF> boxes) {
+    // A helper class to hold a bounding box and its original index, making it easier to manage.
+    private static class WordBox {
+        final RotatedRect box;
+        final int originalIndex;
+
+        WordBox(RotatedRect box, int originalIndex) {
+            this.box = box;
+            this.originalIndex = originalIndex;
+        }
+    }
+
+    /**
+     * Resolves a list of word boxes into lines and sub-lines, mimicking the logic from doctr's DocumentBuilder.
+     * @param boxes A list of RotatedRect objects representing the detected words.
+     * @return A list of lines, where each line is a list of WordBox objects.
+     */
+    private List<List<WordBox>> resolveLines(List<RotatedRect> boxes) {
         if (boxes == null || boxes.isEmpty()) {
             return new ArrayList<>();
         }
 
-        // 1. Sort boxes from top to bottom, then left to right
-        boxes.sort(Comparator.comparing((RectF rect) -> rect.top).thenComparing(rect -> rect.left));
-
-        List<RectF> lines = new ArrayList<>();
-        
-        List<RectF> currentLineBoxes = new ArrayList<>();
-        currentLineBoxes.add(boxes.get(0));
-
-        // 2. Iterate and group based on vertical proximity
-        for (int i = 1; i < boxes.size(); i++) {
-            RectF currentBox = boxes.get(i);
-            // Use the last *added* box to the line for comparison, not the line's center
-            RectF lastBoxInLine = currentLineBoxes.get(currentLineBoxes.size() - 1); 
-
-            float lastBoxCenterY = lastBoxInLine.centerY();
-            float currentBoxCenterY = currentBox.centerY();
-            
-            // Use the height of the last box for tolerance check, as in the python script
-            float tolerance = lastBoxInLine.height() * 0.7f;
-
-            // Check if the vertical centers are close enough 
-            if (Math.abs(currentBoxCenterY - lastBoxCenterY) < tolerance) {
-                currentLineBoxes.add(currentBox);
-            } else {
-                // Finalize the previous line by creating a single bounding box for it.
-                if (!currentLineBoxes.isEmpty()) {
-                    RectF mergedLine = new RectF(currentLineBoxes.get(0));
-                    for (int j = 1; j < currentLineBoxes.size(); j++) {
-                        mergedLine.union(currentLineBoxes.get(j));
-                    }
-                    lines.add(mergedLine);
-                }
-
-                // Start a new line
-                currentLineBoxes.clear();
-                currentLineBoxes.add(currentBox);
-            }
+        // Wrap RotatedRects in WordBox objects to keep track of their original order/index if needed.
+        List<WordBox> wordBoxes = new ArrayList<>();
+        for (int i = 0; i < boxes.size(); i++) {
+            wordBoxes.add(new WordBox(boxes.get(i), i));
         }
 
-        // 3. Add the last remaining line
-        if (!currentLineBoxes.isEmpty()) {
-            RectF mergedLine = new RectF(currentLineBoxes.get(0));
-            for (int j = 1; j < currentLineBoxes.size(); j++) {
-                mergedLine.union(currentLineBoxes.get(j));
+        // 1. Sort boxes from top to bottom, then left to right. This is a crucial step for line formation.
+        wordBoxes.sort(Comparator.comparingDouble((WordBox wb) -> wb.box.center.y)
+                .thenComparingDouble(wb -> wb.box.center.x));
+
+        // 2. Calculate the median height of all boxes to use as a tolerance for line grouping.
+        List<Double> heights = new ArrayList<>();
+        for (WordBox wb : wordBoxes) {
+            heights.add(wb.box.size.height);
+        }
+        Collections.sort(heights);
+        double yMed = heights.isEmpty() ? 0 : (heights.size() % 2 == 0 ?
+                (heights.get(heights.size() / 2 - 1) + heights.get(heights.size() / 2)) / 2.0 :
+                heights.get(heights.size() / 2));
+
+        if (yMed == 0) { // Avoid division by zero if heights are all zero.
+            return new ArrayList<>();
+        }
+
+        List<List<WordBox>> lines = new ArrayList<>();
+        if (wordBoxes.isEmpty()) {
+            return lines;
+        }
+
+        // 3. Group boxes into lines based on vertical proximity.
+        List<WordBox> currentLine = new ArrayList<>();
+        currentLine.add(wordBoxes.get(0));
+        double yCenterSum = wordBoxes.get(0).box.center.y;
+
+        for (int i = 1; i < wordBoxes.size(); i++) {
+            WordBox currentWord = wordBoxes.get(i);
+            // Check the vertical distance between the current word and the center of the current line.
+            double yDist = Math.abs(currentWord.box.center.y - (yCenterSum / currentLine.size()));
+
+            if (yDist > yMed / 2) { // If the distance is too large, it's a new line.
+                lines.addAll(resolveSubLines(currentLine)); // Process the completed line for horizontal breaks.
+                currentLine.clear();
+                yCenterSum = 0;
             }
-            lines.add(mergedLine);
+
+            currentLine.add(currentWord);
+            yCenterSum += currentWord.box.center.y;
+        }
+
+        // Don't forget the last line.
+        if (!currentLine.isEmpty()) {
+            lines.addAll(resolveSubLines(currentLine));
         }
 
         return lines;
+    }
+
+    /**
+     * Splits a single line of words into multiple sub-lines if there are large horizontal gaps between them.
+     * This is useful for handling multiple columns or paragraphs.
+     * @param line A list of WordBox objects representing a single line.
+     * @return A list of sub-lines.
+     */
+    private List<List<WordBox>> resolveSubLines(List<WordBox> line) {
+        List<List<WordBox>> subLines = new ArrayList<>();
+        if (line == null || line.isEmpty()) {
+            return subLines;
+        }
+
+        // Sort words in the line horizontally from left to right.
+        line.sort(Comparator.comparingDouble(wb -> wb.box.boundingRect().x));
+
+        // Heuristic for paragraph break: use the median height of words in the line.
+        // This is an adaptation of the python version's relative paragraph_break.
+        List<Double> heights = new ArrayList<>();
+        for (WordBox wb : line) {
+            heights.add(wb.box.size.height);
+        }
+        Collections.sort(heights);
+        double paragraphBreak = heights.isEmpty() ? 0 : (heights.size() % 2 == 0 ?
+                (heights.get(heights.size() / 2 - 1) + heights.get(heights.size() / 2)) / 2.0 :
+                heights.get(heights.size() / 2));
+
+
+        if (line.size() < 2) {
+            subLines.add(new ArrayList<>(line));
+            return subLines;
+        }
+
+        List<WordBox> currentSubLine = new ArrayList<>();
+        currentSubLine.add(line.get(0));
+
+        for (int i = 1; i < line.size(); i++) {
+            WordBox prevWord = currentSubLine.get(currentSubLine.size() - 1);
+            WordBox currentWord = line.get(i);
+
+            Rect prevBoxRect = prevWord.box.boundingRect();
+            Rect currentBoxRect = currentWord.box.boundingRect();
+
+            // Calculate the horizontal distance between the end of the previous word and the start of the current one.
+            double dist = currentBoxRect.x - (prevBoxRect.x + prevBoxRect.width);
+
+            if (dist > paragraphBreak) { // If the gap is larger than our threshold, start a new sub-line.
+                subLines.add(new ArrayList<>(currentSubLine));
+                currentSubLine.clear();
+            }
+            currentSubLine.add(currentWord);
+        }
+
+        subLines.add(new ArrayList<>(currentSubLine)); // Add the last sub-line.
+
+        return subLines;
+    }
+
+    /**
+     * Calculates the minimum area rotated rectangle that encloses all word boxes in a given line.
+     * @param line A list of WordBox objects representing a single line.
+     * @return A RotatedRect that tightly wraps the entire line.
+     */
+    private RotatedRect getEnclosingLineBox(List<WordBox> line) {
+        if (line == null || line.isEmpty()) {
+            return new RotatedRect(); // Return an empty rect if the line is empty
+        }
+
+        // Collect all corner points from all word boxes in the line
+        List<Point> allPoints = new ArrayList<>();
+        for (WordBox wordBox : line) {
+            Point[] vertices = new Point[4];
+            wordBox.box.points(vertices);
+            Collections.addAll(allPoints, vertices);
+        }
+
+        // Use OpenCV to find the minimum area rectangle enclosing all the collected points
+        MatOfPoint2f pointsMat = new MatOfPoint2f();
+        pointsMat.fromList(allPoints);
+        RotatedRect enclosingBox = Imgproc.minAreaRect(pointsMat);
+
+        pointsMat.release(); // Release the native memory
+
+        return enclosingBox;
     }
 
     private FloatBuffer preprocessImageForRecognition(Bitmap bitmap) {
@@ -1016,18 +1138,22 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
         return floatBuffer;
     }
 
-    private void updateOcrResult(int position, String text, boolean isProcessing) {
-        updateOcrResult(position, text, isProcessing, null);
-    }
-
-    private void updateOcrResult(int position, String text, boolean isProcessing, Bitmap preview) {
+    private void updateOcrResult(int position, Page page, boolean isProcessing) {
         if (position >= 0 && position < ocrResultList.size()) {
             OcrResult result = ocrResultList.get(position);
-            result.setText(text);
+            result.setPage(page);
             result.setProcessing(isProcessing);
-            if (preview != null) {
-                result.setPreviewWithBoxes(preview);
-            }
+            result.setError(null); // Clear previous errors
+            ocrResultAdapter.notifyItemChanged(position);
+        }
+    }
+
+    private void updateOcrResult(int position, String errorMessage, boolean isProcessing, Bitmap preview) {
+        if (position >= 0 && position < ocrResultList.size()) {
+            OcrResult result = ocrResultList.get(position);
+            result.setError(errorMessage);
+            result.setPage(null); // Clear previous page results
+            result.setProcessing(isProcessing);
             ocrResultAdapter.notifyItemChanged(position);
         }
     }
@@ -1395,7 +1521,7 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
     }
 
     private void exportRecognizedText() {
-        if (ocrResultList == null || ocrResultList.stream().allMatch(r -> r.getText() == null || r.getText().isEmpty())) {
+        if (ocrResultList == null || ocrResultList.stream().allMatch(r -> r.getPage() == null || r.getPage().getContent() == null || r.getPage().getContent().isEmpty())) {
             Toast.makeText(this, "No OCR results to export.", Toast.LENGTH_SHORT).show();
             return;
         }
@@ -1427,13 +1553,28 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
     private void exportToFile(String format) {
         StringBuilder fullText = new StringBuilder();
         for (OcrResult result : ocrResultList) {
-            if (result.getText() != null && !result.getText().isEmpty()) {
-                fullText.append(result.getText()).append("\n\n");
+            if (result.getPage() != null && result.getPage().getContent() != null) {
+                fullText.append(result.getPage().getContent()).append("\n\n");
             }
         }
     
         if (fullText.length() == 0) {
             Toast.makeText(this, "No text to export.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+    
+        if ("pdf".equals(format)) {
+            // Mở trình chọn file để user chọn tên và vị trí lưu
+            Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+            intent.addCategory(Intent.CATEGORY_OPENABLE);
+            intent.setType("application/pdf");
+            intent.putExtra(Intent.EXTRA_TITLE, "OCR_Result.pdf");
+            startActivityForResult(intent, REQUEST_CODE_CREATE_PDF);
+            // Lưu nội dung tạm thời để export sau khi user chọn xong
+            pendingExportPdfUri = null; // reset
+            // Lưu nội dung vào biến toàn cục nếu cần (hoặc có thể truyền qua intent nếu muốn nâng cao)
+            // Ở đây, để đơn giản, ta sẽ gọi lại exportToFile khi nhận được kết quả
+            // (xử lý ở onActivityResult)
             return;
         }
     
@@ -1455,26 +1596,7 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
             try (OutputStream os = getContentResolver().openOutputStream(itemUri)) {
                 if (os == null) throw new IOException("Failed to get output stream.");
     
-                if ("pdf".equals(format)) {
-                    values.put(MediaStore.MediaColumns.MIME_TYPE, "application/pdf");
-                    Document document = new Document();
-                    PdfWriter.getInstance(document, os);
-                    document.open();
-                    
-                    try {
-                        InputStream fontStream = getAssets().open("fonts/vuTimes.ttf");
-                        byte[] fontBytes = getBytes(fontStream);
-                        BaseFont bf = BaseFont.createFont("vuTimes.ttf", BaseFont.IDENTITY_H, BaseFont.EMBEDDED, false, fontBytes, null);
-                        Font font = new Font(bf, 12);
-                        document.add(new Paragraph(fullText.toString(), font));
-                    } catch (IOException e) {
-                         Log.w("Export", "Vietnamese font not found, falling back to default.", e);
-                         document.add(new Paragraph(fullText.toString()));
-                    }
-    
-                    document.close();
-    
-                } else if ("docx".equals(format)) {
+                if ("docx".equals(format)) {
                     values.put(MediaStore.MediaColumns.MIME_TYPE, "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
                     XWPFDocument document = new XWPFDocument();
                     String[] lines = fullText.toString().split("\n");
@@ -1560,5 +1682,106 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
                 }
             }
         });
+    }
+
+    /**
+     * Groups a list of lines into blocks of text (paragraphs) using hierarchical clustering.
+     * This method mimics the _resolve_blocks logic from doctr's DocumentBuilder.
+     * @param lines The list of Line objects to group.
+     * @return A list of Block objects.
+     */
+    private List<Block> resolveBlocks(List<Line> lines) {
+        if (lines == null || lines.size() <= 1) {
+            // If there's 0 or 1 line, we can consider it a single block.
+            List<Block> singleBlockList = new ArrayList<>();
+            if (lines != null && !lines.isEmpty()) {
+                RotatedRect blockGeo = getEnclosingLineBox(lines.stream().map(line -> new WordBox(line.getGeometry(), 0)).collect(Collectors.toList()));
+                singleBlockList.add(new Block(lines, blockGeo));
+            }
+            return singleBlockList;
+        }
+
+        // 1. Prepare the feature data for clustering.
+        double[][] features = new double[lines.size()][2];
+        for (int i = 0; i < lines.size(); i++) {
+            Rect lineRect = lines.get(i).getGeometry().boundingRect();
+            features[i][0] = lineRect.y + lineRect.height / 2.0; // Center Y is the primary feature
+            features[i][1] = lineRect.x;                         // Start X is the secondary feature
+        }
+
+        // 2. Perform hierarchical clustering.
+        WardLinkage linkage = WardLinkage.of(features);
+        HierarchicalClustering hclust = HierarchicalClustering.fit(linkage);
+
+        // 3. Partition the dendrogram into flat clusters (blocks).
+        // The distance threshold needs to be tuned. A higher value results in fewer, larger blocks.
+        List<Double> heights = lines.stream().map(line -> line.getGeometry().size.height).sorted().collect(Collectors.toList());
+        double medianHeight = heights.get(heights.size() / 2);
+        // The threshold is a critical parameter. Let's use 1.5x the median line height as a starting point.
+        int[] clusters = hclust.partition(medianHeight * 1.5);
+
+        // 4. Group lines into blocks based on the clustering result.
+        Map<Integer, List<Line>> blockMap = new HashMap<>();
+        for (int i = 0; i < clusters.length; i++) {
+            blockMap.computeIfAbsent(clusters[i], k -> new ArrayList<>()).add(lines.get(i));
+        }
+
+        // 5. Create Block objects from the map.
+        List<Block> resolvedBlocks = new ArrayList<>();
+        for (List<Line> blockLines : blockMap.values()) {
+            if (!blockLines.isEmpty()) {
+                // To get the geometry of the block, we use the helper function
+                // that gets the enclosing box for a list of words.
+                RotatedRect blockGeometry = getEnclosingLineBox(
+                        blockLines.stream()
+                                .map(line -> new WordBox(line.getGeometry(), 0)) // Adapt Line to WordBox for the helper
+                                .collect(Collectors.toList())
+                );
+                resolvedBlocks.add(new Block(blockLines, blockGeometry));
+            }
+        }
+
+        // Sort blocks from top to bottom
+        resolvedBlocks.sort(Comparator.comparingDouble(b -> b.getGeometry().center.y));
+
+        return resolvedBlocks;
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQUEST_CODE_CREATE_PDF && resultCode == RESULT_OK && data != null) {
+            Uri uri = data.getData();
+            if (uri != null) {
+                try (OutputStream os = getContentResolver().openOutputStream(uri)) {
+                    Document document = new Document();
+                    PdfWriter.getInstance(document, os);
+                    document.open();
+                    try {
+                        InputStream fontStream = getAssets().open("fonts/vuTimes.ttf");
+                        byte[] fontBytes = getBytes(fontStream);
+                        BaseFont bf = BaseFont.createFont("vuTimes.ttf", BaseFont.IDENTITY_H, BaseFont.EMBEDDED, false, fontBytes, null);
+                        Font font = new Font(bf, 12);
+                        document.add(new Paragraph(fullTextForExport(), font));
+                    } catch (IOException e) {
+                        document.add(new Paragraph(fullTextForExport()));
+                    }
+                    document.close();
+                    Toast.makeText(this, "Exported successfully", Toast.LENGTH_LONG).show();
+                } catch (Exception e) {
+                    Toast.makeText(this, "Error exporting file: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                }
+            }
+        }
+    }
+
+    private String fullTextForExport() {
+        StringBuilder fullText = new StringBuilder();
+        for (OcrResult result : ocrResultList) {
+            if (result.getPage() != null && result.getPage().getContent() != null) {
+                fullText.append(result.getPage().getContent()).append("\n\n");
+            }
+        }
+        return fullText.toString();
     }
 }

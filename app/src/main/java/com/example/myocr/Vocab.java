@@ -101,7 +101,10 @@ public class Vocab {
     }
 
     public int getVocabSize() {
-        // The model's vocabulary size is the number of characters + 1 for the blank token.
-        return i2c.size() + 1;
+        // For a CTC model, the output layer of the network has a size equal to
+        // the number of characters in the vocabulary plus one for the special "blank" token.
+        // For example, if your vocabulary has 95 characters (indices 0-94),
+        // the blank token will have index 95, and the model's output dimension will be 96.
+        return c2i.size() + 1;
     }
 } 

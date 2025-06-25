@@ -4,12 +4,12 @@ plugins {
 
 android {
     namespace 'com.example.myocr'
-    compileSdk 35
+    compileSdk 34
 
     defaultConfig {
         applicationId "com.example.myocr"
         minSdk 26
-        targetSdk 35
+        targetSdk 34
         versionCode 1
         versionName "1.0"
 
@@ -23,8 +23,9 @@ android {
         }
     }
     compileOptions {
-        sourceCompatibility JavaVersion.VERSION_11
-        targetCompatibility JavaVersion.VERSION_11
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+        coreLibraryDesugaringEnabled true
     }
     buildFeatures {
         viewBinding true
@@ -32,6 +33,7 @@ android {
 }
 
 dependencies {
+    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.0.4'
     implementation 'com.squareup.okhttp3:okhttp:4.9.3'
     implementation 'com.squareup.okio:okio:2.10.0'
     implementation libs.appcompat
@@ -51,4 +53,9 @@ dependencies {
     implementation 'com.microsoft.onnxruntime:onnxruntime-android:1.17.3'
     implementation project(':sdk')
     implementation 'com.github.chrisbanes:PhotoView:2.3.0'
+    implementation 'com.google.code.gson:gson:2.8.8'
+    implementation 'com.github.haifengl:smile-core:3.0.1'
+    implementation 'org.bytedeco:javacpp:1.5.11'
+    implementation 'org.bytedeco:openblas:0.3.28-1.5.11:android-arm64'
+    implementation 'org.bytedeco:openblas:0.3.28-1.5.11:android-x86_64'
 }
