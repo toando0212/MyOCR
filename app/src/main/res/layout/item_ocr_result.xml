@@ -3,7 +3,7 @@
     xmlns:tools="http://schemas.android.com/tools"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
-    android:orientation="horizontal"
+    android:orientation="vertical"
     android:padding="8dp"
     android:layout_marginBottom="8dp"
     android:layout_marginStart="8dp"
@@ -11,25 +11,29 @@
     android:background="@drawable/border_bg"
     android:elevation="2dp">
 
-    <ImageView
-        android:id="@+id/resultImageView"
-        android:layout_width="80dp"
-        android:layout_height="80dp"
-        android:scaleType="centerCrop"
-        android:layout_marginEnd="8dp"
-        tools:srcCompat="@tools:sample/backgrounds/scenic" />
-
-    <ScrollView
-        android:layout_width="0dp"
+    <TextView
+        android:id="@+id/tvOcrResult"
+        android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_weight="1">
+        android:textIsSelectable="true"
+        android:textSize="14sp"
+        tools:text="Recognized text goes here." />
 
-        <TextView
-            android:id="@+id/resultTextView"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:textIsSelectable="true"
-            android:textSize="14sp"
-            tools:text="Recognized text goes here." />
-    </ScrollView>
+    <ProgressBar
+        android:id="@+id/pbSingleItem"
+        style="?android:attr/progressBarStyle"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:visibility="gone" />
+
+    <ImageView
+        android:id="@+id/ivPreview"
+        android:layout_width="match_parent"
+        android:layout_height="200dp"
+        android:layout_marginTop="8dp"
+        android:scaleType="centerCrop"
+        android:visibility="gone"
+        android:contentDescription="@string/ocr_preview_image" />
+
 </LinearLayout> 

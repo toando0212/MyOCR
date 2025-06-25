@@ -3,7 +3,5 @@
   <component name="VcsDirectoryMappings">
     <mapping directory="$PROJECT_DIR$" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/Handwritten-and-Printed-Text-Classification-in-Doctors-Prescription" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/app/src/main/assets/VietOCR" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/app/src/main/assets/VietOCR/vietocr" vcs="Git" />
   </component>
 </project>

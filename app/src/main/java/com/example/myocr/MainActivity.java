@@ -8,6 +8,7 @@ import android.content.res.Configuration;
 import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.graphics.Canvas;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -48,6 +49,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.Map;
+import java.util.Collections;
 
 import okhttp3.*;
 import org.json.JSONArray;
@@ -78,6 +81,20 @@ import java.nio.ByteBuffer;
 import java.nio.FloatBuffer;
 import android.content.res.AssetFileDescriptor;
 import java.util.Optional;
+import android.graphics.RectF;
+import java.util.Comparator;
+import org.opencv.core.MatOfPoint;
+import org.opencv.core.MatOfPoint2f;
+import org.opencv.core.RotatedRect;
+import org.opencv.core.Point;
+import org.opencv.imgproc.Imgproc;
+import org.opencv.core.Size;
+import org.opencv.core.Core;
+import org.opencv.android.Utils;
+import org.opencv.core.Mat;
+import org.opencv.core.CvType;
+import org.opencv.core.Scalar;
+import org.opencv.core.Rect;
 
 public class MainActivity extends AppCompatActivity implements ImageAdapter.OnImageClickListener, HistoryAdapter.OnHistorySessionInteractionListener {
     private static final int REQUEST_CAMERA_PERMISSION = 100;
@@ -142,34 +159,20 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
-        // Initialize ONNX Runtime
+        // Initialize ONNX Runtime but do not load the heavy models yet.
         try {
             ortEnv = OrtEnvironment.getEnvironment();
-
-            byte[] vietocrModelData = readBytesFromAsset("vietocr_vgg_seq2seq_opset14.onnx");
-            ortSession = ortEnv.createSession(vietocrModelData);
-
-            byte[] detectionModelData = readBytesFromAsset("fast_small_detection.onnx");
-            detectionSession = ortEnv.createSession(detectionModelData);
-
-            byte[] englishRecognitionModelData = readBytesFromAsset("vitstr_small_recognition.onnx");
-            englishRecognitionSession = ortEnv.createSession(englishRecognitionModelData);
-
-            Log.d("MainActivity", "All ONNX models loaded successfully.");
-
-            // Initialize Vocabularies
-            // Vietnamese vocabulary from base.yml
-            String vietnameseChars = "aAàÀảẢãÃáÁạẠăĂằẰẳẲẵẴắẮặẶâÂầẦẩẨẫẪấẤậẬbBcCdDđĐeEèÈẻẺẽẼéÉẹẸêÊềỀểỂễỄếẾệỆfFgGhHiIìÌỉỈĩĨíÍịỊjJkKlLmMnNoOòÒỏỎõÕóÓọỌôÔồỒổỔỗỖốỐộỘơƠờỜởỞỡỠớỚợƠpPqQrRsStTuUùÙủỦũŨúÚụỤưƯừỪửỬữỮứỨựỨvVwWxXyYỳỲỷỶỹỸýÝỵỴzZ0123456789!\\\"#$%&\'()*+,-./:;<=>?@[\\\\]^_`{|}~ ";
-            vietnameseVocab = new Vocab(vietnameseChars);
-
-            // English vocabulary (common characters, you might need to adjust this based on vitstr_small_recognition's actual vocab)
-            String englishChars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!\\\"#$%&\'()*+,-./:;<=>?@[\\\\]^_`{|}~ ";
-            englishVocab = new Vocab(englishChars);
-
         } catch (Exception e) {
-            Log.e("MainActivity", "Error loading ONNX models or vocab: " + e.getMessage());
-            Toast.makeText(this, "Error loading ONNX models or vocab: " + e.getMessage(), Toast.LENGTH_LONG).show();
+            Log.e("MainActivity", "Could not initialize OrtEnvironment.", e);
+            Toast.makeText(this, "Failed to initialize ONNX Runtime.", Toast.LENGTH_LONG).show();
+            // btnRunOcr could be null here, so we find it first.
+            // But it's better to disable it after findViewById
         }
+            
+        // The vocabulary can be initialized here as it's lightweight.
+        // IMPORTANT: The vocab must NOT contain the blank character, it's implicitly handled as index 0.
+        String englishChars = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~ ";
+        englishVocab = new Vocab(englishChars);
 
         // Đọc ngôn ngữ đã lưu (nếu có)
         String lang = getSharedPreferences("settings", MODE_PRIVATE).getString("lang", "en");
@@ -197,6 +200,10 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
         fab = findViewById(R.id.fab);
         tvDeleteInstruction = findViewById(R.id.tv_delete_instruction);
 
+        if (ortEnv == null) {
+            btnRunOcr.setEnabled(false);
+        }
+
         // Setup for the selected images RecyclerView
         imageAdapter = new ImageAdapter(this, imageUris, this);
         imageRecyclerView.setLayoutManager(new LinearLayoutManager(this, LinearLayoutManager.HORIZONTAL, false));
@@ -213,21 +220,24 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
                 result -> {
                     if (result.getResultCode() == RESULT_OK && result.getData() != null) {
                         Intent data = result.getData();
+                        ArrayList<Uri> selectedUris = new ArrayList<>();
                         if (data.getClipData() != null) {
                             int count = data.getClipData().getItemCount();
                             for (int i = 0; i < count; i++) {
                                 Uri imageUri = data.getClipData().getItemAt(i).getUri();
                                 if (imageUri != null) {
-                                    imageUris.add(imageUri);
+                                    selectedUris.add(imageUri);
                                 }
                             }
-                            imageAdapter.setImageUris(imageUris); // Update for multi-select
                         } else if (data.getData() != null) {
+                            // Handle single image selection as well
                             Uri imageUri = data.getData();
-                            // Immediately launch ImageViewerActivity for a new image
+                            selectedUris.add(imageUri);
+                        }
+                        
+                        if (!selectedUris.isEmpty()) {
                             Intent intent = new Intent(MainActivity.this, ImageViewerActivity.class);
-                            intent.setData(imageUri);
-                            intent.putExtra("image_position", -1); // -1 indicates a new image
+                            intent.putParcelableArrayListExtra("image_uris", selectedUris);
                             imageViewerLauncher.launch(intent);
                         }
                     }
@@ -239,8 +249,12 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
                 result -> {
                     if (result.getResultCode() == RESULT_OK) {
                         if (cameraImageUri != null) {
-                            imageUris.add(cameraImageUri);
-                            imageAdapter.setImageUris(imageUris);
+                            ArrayList<Uri> selectedUris = new ArrayList<>();
+                            selectedUris.add(cameraImageUri);
+                            
+                            Intent intent = new Intent(MainActivity.this, ImageViewerActivity.class);
+                            intent.putParcelableArrayListExtra("image_uris", selectedUris);
+                            imageViewerLauncher.launch(intent);
                         }
                     }
                 }
@@ -250,28 +264,30 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
                 new ActivityResultContracts.StartActivityForResult(),
                 result -> {
                     if (result.getResultCode() == RESULT_OK && result.getData() != null) {
-                        Uri editedImageUri = result.getData().getData();
-                        int position = result.getData().getIntExtra("image_position", -1);
-
-                        if (editedImageUri != null) {
-                            if (position > -1 && position < imageUris.size()) {
-                                // Replace existing image
-                                imageUris.set(position, editedImageUri);
-                            } else {
-                                // Add new image
-                                imageUris.add(editedImageUri);
-                            }
-                            imageAdapter.setImageUris(imageUris);
+                        // This is the result from ImageViewerActivity
+                        if (result.getData().hasExtra("processed_uris")) {
+                            ArrayList<Uri> processedUris = result.getData().getParcelableArrayListExtra("processed_uris");
+                            imageUris.clear();
+                            imageUris.addAll(processedUris);
+                            imageAdapter.notifyDataSetChanged();
+                            updateDeleteInstructionVisibility();
+                            // Clear previous OCR results as the image list has changed
+                            ocrResultList.clear();
+                            ocrResultAdapter.notifyDataSetChanged();
+                            btnRunOcr.setEnabled(!imageUris.isEmpty());
+                            btnExport.setEnabled(false); // Disable export until new OCR is run
                         }
                     }
                 }
         );
-
-        fab.setOnClickListener(v -> showImageSourceDialog());
-
+        
         btnRunOcr.setOnClickListener(v -> runOcrOnImages());
         btnStopOcr.setOnClickListener(v -> showStopOcrConfirmationDialog());
         btnExport.setOnClickListener(v -> exportRecognizedText());
+        fab.setOnClickListener(view -> showImageSourceDialog());
+
+        // Disable Vietnamese option as vocab is missing
+        radioVietnamese.setEnabled(false);
 
         // Đặt trạng thái radio theo ngôn ngữ đã lưu
         if ("vi".equals(lang)) {
@@ -359,10 +375,6 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
             ActivityCompat.requestPermissions(this, new String[]{Manifest.permission.CAMERA}, REQUEST_CAMERA_PERMISSION);
             return;
         }
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
-            ActivityCompat.requestPermissions(this, new String[]{Manifest.permission.READ_EXTERNAL_STORAGE}, 101);
-            return;
-        }
         Intent intent = new Intent(MediaStore.ACTION_IMAGE_CAPTURE);
         ContentValues values = new ContentValues();
         values.put(MediaStore.Images.Media.TITLE, "New Picture");
@@ -373,10 +385,10 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
     }
 
     private void openGallery() {
-        Intent intent = new Intent(Intent.ACTION_PICK, MediaStore.Images.Media.EXTERNAL_CONTENT_URI);
+        Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
         intent.setType("image/*");
         intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
-        pickImageLauncher.launch(intent);
+        pickImageLauncher.launch(Intent.createChooser(intent, "Select Pictures"));
     }
 
     @Override
@@ -385,433 +397,719 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
         if (requestCode == REQUEST_CAMERA_PERMISSION) {
             if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
                 openCamera();
-            }
-        } else if (requestCode == 101) {
-            if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-                // Permission granted, retry the operation
             } else {
-                Toast.makeText(this, "Permission denied to read external storage", Toast.LENGTH_SHORT).show();
+                Toast.makeText(this, "Camera permission is required to use the camera.", Toast.LENGTH_SHORT).show();
             }
         } else if (requestCode == REQUEST_WRITE_STORAGE_PERMISSION) {
             if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-                Toast.makeText(this, "Storage permission granted. Please try exporting again.", Toast.LENGTH_SHORT).show();
+                // Permission was granted. Show the format selection dialog.
+                showExportFormatDialog();
             } else {
-                Toast.makeText(this, "Storage permission denied. Cannot export file.", Toast.LENGTH_SHORT).show();
+                Toast.makeText(this, "Storage permission is required to export the file.", Toast.LENGTH_SHORT).show();
             }
         }
     }
 
     private void runOcrOnImages() {
-        if (imageUris.isEmpty()) {
-            Toast.makeText(this, R.string.please_select_image, Toast.LENGTH_SHORT).show();
+        if (imageUris == null || imageUris.isEmpty()) {
+            Toast.makeText(this, "Please select images first.", Toast.LENGTH_SHORT).show();
             return;
         }
+        
+        // Lazy load the models on first OCR run
+        if (detectionSession == null || englishRecognitionSession == null || vietnameseVocab == null) {
+             Toast.makeText(this, "Loading models, please wait...", Toast.LENGTH_LONG).show();
+             new Thread(() -> {
+                 try {
+                    // Load models and vocab
+                    detectionSession = ortEnv.createSession(assetFilePath("fast_small.onnx"), new OrtSession.SessionOptions());
+                    englishRecognitionSession = ortEnv.createSession(assetFilePath("vitstr_small.onnx"), new OrtSession.SessionOptions());
+                    
+                    // Load Vietnamese vocab - DISABLED for now
+                    // try (InputStream is = getAssets().open("vi_vocab.txt")) {
+                    //    vietnameseVocab = new Vocab(new String(getBytes(is)));
+                    // }
+                    
+                    Log.d("OcrDebugging", "Detection Model Output Nodes: " + detectionSession.getOutputInfo().keySet().toString());
+                    
+                    runOnUiThread(() -> {
+                         Toast.makeText(MainActivity.this, "Models loaded. Starting OCR.", Toast.LENGTH_SHORT).show();
+                         runOcrOnImagesInternal();
+                    });
 
-        stopOcrRequested = false; // Reset stop flag
-        currentOcrIndex = -1;
+                 } catch (Exception e) {
+                     Log.e("MainActivity", "Failed to load ONNX models", e);
+                     runOnUiThread(() -> Toast.makeText(MainActivity.this, "Error loading models: " + e.getMessage(), Toast.LENGTH_LONG).show());
+                 }
+             }).start();
+        } else {
+            runOcrOnImagesInternal();
+        }
+    }
+
+    private void runOcrOnImagesInternal() {
+        stopOcrRequested = false;
         ocrResultList.clear();
         for (Uri uri : imageUris) {
-            ocrResultList.add(new OcrResult(uri, "Queued...", false));
+            ocrResultList.add(new OcrResult(uri, "Processing...", true));
         }
-        ocrResultAdapter.setOcrResults(ocrResultList);
-
-        updateOcrUiState(true); // Show progress and stop button
+        ocrResultAdapter.notifyDataSetChanged();
+        
+        currentOcrIndex = 0;
+        updateOcrUiState(true);
         processNextImage();
     }
-
+    
     private void processNextImage() {
-        // Check if the process was requested to stop
         if (stopOcrRequested) {
-            updateOcrUiState(false); // Ensure UI is reset
-            return;
+             updateOcrUiState(false);
+             Toast.makeText(this, "OCR stopped by user.", Toast.LENGTH_SHORT).show();
+             return;
         }
-
-        currentOcrIndex++;
-        if (currentOcrIndex >= imageUris.size()) {
-            Toast.makeText(this, "All images processed.", Toast.LENGTH_SHORT).show();
-            updateOcrUiState(false); // Hide progress bar and stop button
-            if (isLoggedIn) fetchHistory(); // Refresh history
-            return;
+        if (currentOcrIndex < imageUris.size()) {
+            Uri imageUri = imageUris.get(currentOcrIndex);
+            performOcrForImage(imageUri, currentOcrIndex);
+        } else {
+            // All images processed
+            updateOcrUiState(false);
+            // Save to history if logged in
+            if (isLoggedIn && !ocrResultList.isEmpty()) {
+                saveSessionToHistory();
+            }
         }
+    }
+    
+    private void performOcrForImage(Uri imageUri, final int position) {
+        new Thread(() -> {
+            try {
+                // 1. Load the original bitmap
+                Bitmap originalBitmap = BitmapFactory.decodeStream(getContentResolver().openInputStream(imageUri));
+                Mat originalMat = new Mat();
+                Utils.bitmapToMat(originalBitmap, originalMat);
+                // Important: work with RGB, not BGR
+                Imgproc.cvtColor(originalMat, originalMat, Imgproc.COLOR_RGBA2RGB);
 
-        // Update progress bar
-        progressBar.setMax(imageUris.size());
-        progressBar.setProgress(currentOcrIndex + 1);
+                // 2. Run Detection to get ROTATED bounding boxes
+                List<RotatedRect> boxes = runDetection(originalBitmap);
+                Log.d("OcrDebugging", "Found " + boxes.size() + " boxes in detection phase.");
 
-        Uri imageUri = imageUris.get(currentOcrIndex);
-        updateOcrResult(currentOcrIndex, getString(R.string.processing), true);
-        performOcrForImage(imageUri, currentOcrIndex, userId);
+                // --- START: Draw Bounding Boxes for Preview ---
+                Bitmap previewBitmap = originalBitmap.copy(Bitmap.Config.ARGB_8888, true);
+                Mat previewMat = new Mat();
+                Utils.bitmapToMat(previewBitmap, previewMat);
+
+                for (RotatedRect box : boxes) {
+                    Point[] vertices = new Point[4];
+                    box.points(vertices);
+                    MatOfPoint points = new MatOfPoint(vertices);
+                    Imgproc.polylines(previewMat, Collections.singletonList(points), true, new Scalar(0, 255, 0), 2); // Green boxes
+                }
+                Utils.matToBitmap(previewMat, previewBitmap);
+                // --- END: Draw Bounding Boxes for Preview ---
+
+                // Sort boxes from top to bottom, left to right for sequential reading
+                boxes.sort(Comparator.comparingDouble((RotatedRect rect) -> rect.center.y)
+                                   .thenComparingDouble(rect -> rect.center.x));
+
+                StringBuilder resultText = new StringBuilder();
+                OrtSession sessionToUse;
+                Vocab vocabToUse;
+                String selectedLang = radioVietnamese.isChecked() ? "vi" : "en";
+
+                if ("vi".equals(selectedLang)) {
+                    sessionToUse = ortSession;
+                    vocabToUse = vietnameseVocab;
+                    if(vocabToUse == null) {
+                        runOnUiThread(() -> Toast.makeText(MainActivity.this, "Vietnamese model not available.", Toast.LENGTH_SHORT).show());
+                        updateOcrResult(position, "Error: Vietnamese model not available.", false, null);
+                        triggerNextImageProcessing();
+                        return;
+                    }
+                } else {
+                    sessionToUse = englishRecognitionSession;
+                    vocabToUse = englishVocab;
+                }
+
+                if(sessionToUse == null || vocabToUse == null) {
+                    throw new IOException("Models or vocabulary for the selected language are not loaded.");
+                }
+
+                // We will draw the boxes and also perform recognition in this loop
+                // The original image Mat is needed for cropping
+                Mat originalMatForCropping = new Mat();
+                Utils.bitmapToMat(originalBitmap, originalMatForCropping);
+
+                List<String> recognizedTexts = new ArrayList<>();
+                for (RotatedRect box : boxes) {
+                    // --- START: Safety Check & Clamp Bounding Box ---
+                    // Get the upright bounding box of the rotated rect
+                    Rect uprightBox = box.boundingRect();
+
+                    // Intersect the box with the image boundaries to clamp it.
+                    // This prevents cropping outside the originalMat, which causes a crash.
+                    int x = Math.max(0, uprightBox.x);
+                    int y = Math.max(0, uprightBox.y);
+                    int width = Math.min(originalMatForCropping.cols() - x, uprightBox.width);
+                    int height = Math.min(originalMatForCropping.rows() - y, uprightBox.height);
+
+                    // If the clamped box has no area, it's invalid. Skip it.
+                    if (width <= 1 || height <= 1) {
+                        continue;
+                    }
+                    Rect clampedBox = new Rect(x, y, width, height);
+                    // --- END: Safety Check & Clamp Bounding Box ---
+
+                    // Crop the original image using the SAFE, clamped bounding box
+                    Mat croppedMat = new Mat(originalMatForCropping, clampedBox);
+
+                    // --- RECOGNITION PART ---
+                    // Now that we have a safe cropped Mat, proceed with recognition.
+                    // The existing code for recognition expects a Bitmap.
+                    Bitmap croppedBitmap = Bitmap.createBitmap(croppedMat.cols(), croppedMat.rows(), Bitmap.Config.ARGB_8888);
+                    Utils.matToBitmap(croppedMat, croppedBitmap);
+
+                    // The recognition model expects a specific input size (e.g., 32x128)
+                    // The preprocessImageForRecognition function handles resizing and padding.
+                    FloatBuffer recInputBuffer = preprocessImageForRecognition(croppedBitmap);
+                    long[] recShape = {1, 3, 32, 128}; // IMPORTANT: Adjust if your recognition model has a different input shape
+
+                    try (OnnxTensor recInputTensor = OnnxTensor.createTensor(ortEnv, recInputBuffer, recShape)) {
+                        OrtSession.Result recResult = sessionToUse.run(Collections.singletonMap("input", recInputTensor));
+                        float[][][] recOutput = (float[][][]) recResult.get(0).getValue();
+                        String recognizedText = vocabToUse.decode(recOutput);
+                        recognizedTexts.add(recognizedText);
+                        recResult.close(); // Release result resources
+                    } catch (Exception e) {
+                        Log.e("MainActivity", "Error during recognition for a box", e);
+                    }
+                    // Release memory
+                    croppedMat.release();
+                    croppedBitmap.recycle();
+                }
+
+                // --- END: Recognition Loop ---
+
+                // After the loop, join all recognized texts
+                String finalOcrText = String.join(" ", recognizedTexts);
+
+                // Update the UI
+                final int finalPosition = position;
+                Bitmap finalPreviewBitmap = previewBitmap.copy(previewBitmap.getConfig(), false);
+                runOnUiThread(() -> {
+                    updateOcrResult(finalPosition, finalOcrText, false, finalPreviewBitmap);
+                    triggerNextImageProcessing();
+                });
+
+            } catch (Exception e) {
+                Log.e("MainActivity", "Error during OCR for image " + position, e);
+                runOnUiThread(() -> {
+                    updateOcrResult(position, "Error: " + e.getMessage(), false, null);
+                    triggerNextImageProcessing();
+                });
+            }
+        }).start();
     }
 
-    private void exportRecognizedText() {
-        if (ocrResultList.isEmpty() || getCombinedOcrText().isEmpty()) {
-            Toast.makeText(this, "Không có văn bản để xuất.", Toast.LENGTH_SHORT).show();
-            return;
+    private List<RotatedRect> runDetection(Bitmap bitmap) throws Exception {
+        int targetSize = 512;
+        // The ratio of the original image
+        double ratio = (double) bitmap.getWidth() / (double) bitmap.getHeight();
+
+        // The size of the resized image
+        int resizedWidth, resizedHeight;
+        if (ratio > 1) { // Landscape
+            resizedWidth = targetSize;
+            resizedHeight = (int) (targetSize / ratio);
+        } else { // Portrait or Square
+            resizedHeight = targetSize;
+            resizedWidth = (int) (targetSize * ratio);
         }
 
-        final String[] formats = {"PDF", "DOCX"};
-        AlertDialog.Builder builder = new AlertDialog.Builder(this);
-        builder.setTitle("Chọn định dạng xuất");
-        builder.setItems(formats, (dialog, which) -> {
-            if (which == 0) {
-                exportToFile("pdf");
+        // Prevent dimensions from becoming zero for highly skewed images
+        resizedWidth = Math.max(1, resizedWidth);
+        resizedHeight = Math.max(1, resizedHeight);
+
+        // Calculate padding
+        int top = (targetSize - resizedHeight) / 2;
+        int left = (targetSize - resizedWidth) / 2;
+
+        float[] mean = {0.485f, 0.456f, 0.406f};
+        float[] std = {0.229f, 0.224f, 0.225f};
+
+        FloatBuffer inputBuffer = preprocessImageForDetection(bitmap, targetSize, resizedWidth, resizedHeight, mean, std);
+        long[] shape = {1, 3, targetSize, targetSize};
+
+        try (OnnxTensor inputTensor = OnnxTensor.createTensor(ortEnv, inputBuffer, shape)) {
+            OrtSession.Result result = detectionSession.run(Collections.singletonMap("input", inputTensor));
+            // The model has a single output: logits
+            float[][][][] logits = (float[][][][]) result.get(0).getValue();
+            // The actual post-processing happens here
+            return decodeDetectionOutput(logits, bitmap.getWidth(), bitmap.getHeight(), 0.1f, resizedWidth, resizedHeight, left, top);
+        }
+    }
+
+    private List<RotatedRect> decodeDetectionOutput(float[][][][] logits, int originalWidth, int originalHeight, float boxThreshold, int resizedWidth, int resizedHeight, int padLeft, int padTop) {
+        // Correct post-processing based on original doctr source code
+        // The single output are logits, not a probability map.
+        // Shape is (1, 1, H, W)
+        float[][] logitsMap = logits[0][0];
+        int height = logitsMap.length;
+        int width = logitsMap[0].length;
+
+        // --- 1. Create Mat from logits ---
+        Mat logitsMat = new Mat(height, width, CvType.CV_32F);
+        for (int y = 0; y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                logitsMat.put(y, x, logitsMap[y][x]);
+            }
+        }
+
+        // --- 2. Dilation (MaxPool2d in PyTorch) applied on raw LOGITS ---
+        // This is the equivalent of `self.pooling(logits)`
+        Mat dilatedLogitsMat = new Mat();
+        // Kernel size 2, stride 1 as a common approximation for FAST's pooling layer.
+        Mat kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, new Size(2, 2));
+        Imgproc.dilate(logitsMat, dilatedLogitsMat, kernel);
+
+        // --- 3. Sigmoid activation to get the probability map ---
+        // This is the equivalent of `torch.sigmoid(...)`
+        Mat probMapMat = new Mat(height, width, CvType.CV_32F);
+        for (int y = 0; y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                float logit = (float) dilatedLogitsMat.get(y, x)[0];
+                probMapMat.put(y, x, (float) (1.0 / (1.0 + Math.exp(-logit))));
+            }
+        }
+        logitsMat.release(); // free memory
+        dilatedLogitsMat.release();
+
+        // --- 4. Binarization ---
+        // Equivalent to `bitmap = prob_map > bin_thresh`
+        Mat binaryMap = new Mat();
+        float binThresh = 0.1f; // Binarization threshold from FASTPostProcessor default
+        Imgproc.threshold(probMapMat, binaryMap, binThresh, 255, Imgproc.THRESH_BINARY);
+        binaryMap.convertTo(binaryMap, CvType.CV_8U);
+
+        // --- 5. Find Contours ---
+        List<MatOfPoint> contours = new ArrayList<>();
+        Mat hierarchy = new Mat();
+        Imgproc.findContours(binaryMap, contours, hierarchy, Imgproc.RETR_LIST, Imgproc.CHAIN_APPROX_SIMPLE);
+        hierarchy.release();
+        binaryMap.release();
+
+        List<RotatedRect> validBoxes = new ArrayList<>();
+        // Scaling factor to map coordinates from the resized image (inside the canvas) back to the original image
+        double scale = (double) originalWidth / resizedWidth;
+        if (originalWidth < originalHeight) {
+            scale = (double) originalHeight / resizedHeight;
+        }
+
+        // --- 6. Filter Contours by Score & Area ---
+        for (MatOfPoint contour : contours) {
+            MatOfPoint2f contour2f = new MatOfPoint2f(contour.toArray());
+
+            // --- 6a. Filter by area (simple check) ---
+            if (Imgproc.contourArea(contour) < 2) {
+                contour.release();
+                contour2f.release();
+                continue;
+            }
+
+            // --- 6b. Calculate confidence score (like `box_score` in python) ---
+            // Create a mask for the contour area, then calculate the mean of the prob_map within that mask.
+            Mat mask = Mat.zeros(height, width, CvType.CV_8U);
+            Imgproc.drawContours(mask, Collections.singletonList(contour), -1, new Scalar(255), -1);
+            Scalar meanScoreScalar = Core.mean(probMapMat, mask);
+            mask.release();
+            float score = (float) meanScoreScalar.val[0];
+
+            // --- 6c. Filter by box_thresh ---
+            if (score < boxThreshold) {
+                contour.release();
+                contour2f.release();
+                continue;
+            }
+
+            // --- 7. Unclip & Get Final Bounding Box ---
+            // This section implements polygon offsetting, a more accurate way to expand the tight
+            // bounding box from the contour, inspired by the Pyclipper logic in the original library.
+            // Instead of scaling the final rectangle, we dilate the polygon contour itself.
+
+            double area = Imgproc.contourArea(contour);
+            double length = Imgproc.arcLength(contour2f, true);
+            if (length == 0) { // Avoid division by zero for invalid contours
+                contour.release();
+                contour2f.release();
+                continue;
+            }
+
+            double unclipRatio = 1.5; // A common ratio for this technique, providing more padding.
+            double distance = (area * unclipRatio) / length;
+
+            int offset = (int) Math.round(distance);
+            if (offset == 0) {
+                 // Ensure there is at least a minimal expansion
+                 offset = 1;
+            }
+            Mat unclipKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, new Size(2 * offset + 1, 2 * offset + 1));
+
+            Mat dilatedContourMask = new Mat();
+            // Draw the single contour on a black canvas to dilate it
+            Mat tempMask = Mat.zeros(height, width, CvType.CV_8U);
+            Imgproc.drawContours(tempMask, Collections.singletonList(contour), 0, new Scalar(255), -1);
+            Imgproc.dilate(tempMask, dilatedContourMask, unclipKernel);
+            tempMask.release();
+            unclipKernel.release();
+
+            List<MatOfPoint> dilatedContours = new ArrayList<>();
+            Imgproc.findContours(dilatedContourMask, dilatedContours, new Mat(), Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE);
+            dilatedContourMask.release();
+
+            RotatedRect box;
+            if (!dilatedContours.isEmpty() && dilatedContours.get(0).total() > 0) {
+                // Take the first (and likely only) contour after dilation
+                box = Imgproc.minAreaRect(new MatOfPoint2f(dilatedContours.get(0).toArray()));
+                // Clean up memory
+                for(MatOfPoint c : dilatedContours) { c.release(); }
             } else {
-                exportToFile("docx");
-            }
-        });
-        builder.show();
-    }
-
-    private void exportToFile(String format) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
-                ActivityCompat.requestPermissions(this, new String[]{Manifest.permission.WRITE_EXTERNAL_STORAGE}, REQUEST_WRITE_STORAGE_PERMISSION);
-                return;
-            }
-        }
-
-        if ("pdf".equals(format)) {
-            createPdf();
-        } else if ("docx".equals(format)) {
-            createDocx();
-        }
-    }
-
-    private String getCombinedOcrText() {
-        StringBuilder fullText = new StringBuilder();
-        for (OcrResult result : ocrResultList) {
-            if (result.getRecognizedText() != null && !result.getRecognizedText().isEmpty() &&
-                    !result.getRecognizedText().equals("Queued...") && !result.getRecognizedText().equals("Đang xử lý...") &&
-                    !result.getRecognizedText().contains("Error") && !result.getRecognizedText().contains("Lỗi")) {
-                fullText.append(result.getRecognizedText()).append("\n\n---\n\n");
-            }
-        }
-        return fullText.toString();
-    }
-
-    private void createPdf() {
-        String ocrText = getCombinedOcrText();
-        String fileName = "OCR_Result_" + System.currentTimeMillis() + ".pdf";
-
-        ContentValues contentValues = new ContentValues();
-        contentValues.put(MediaStore.MediaColumns.DISPLAY_NAME, fileName);
-        contentValues.put(MediaStore.MediaColumns.MIME_TYPE, "application/pdf");
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            contentValues.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
-        }
-
-        Uri uri = getContentResolver().insert(Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
-                ? MediaStore.Downloads.EXTERNAL_CONTENT_URI
-                : MediaStore.Files.getContentUri("external"), contentValues);
-
-        if (uri != null) {
-            try (OutputStream outputStream = getContentResolver().openOutputStream(uri)) {
-                Document document = new Document();
-                PdfWriter.getInstance(document, outputStream);
-                document.open();
-
-                try {
-                    BaseFont baseFont = BaseFont.createFont("assets/fonts/Roboto_Condensed-BoldItalic.ttf", BaseFont.IDENTITY_H, BaseFont.EMBEDDED);
-                    Font vietnameseFont = new Font(baseFont, 12);
-                    document.add(new Paragraph(ocrText, vietnameseFont));
-                } catch (Exception e) {
-                    Log.e("PDF_FONT", "Lỗi tải font, sử dụng font mặc định.", e);
-                    document.add(new Paragraph(ocrText));
+                // Fallback to the original contour if dilation produces nothing
+                box = Imgproc.minAreaRect(contour2f);
+                 if (!dilatedContours.isEmpty()) {
+                    for(MatOfPoint c : dilatedContours) { c.release(); }
                 }
-                
-                document.close();
-                Toast.makeText(this, "Đã lưu PDF vào thư mục Downloads.", Toast.LENGTH_LONG).show();
-            } catch (Exception e) {
-                Log.e("ExportPDF", "Không thể tạo tệp PDF", e);
-                Toast.makeText(this, "Lỗi khi lưu tệp PDF.", Toast.LENGTH_SHORT).show();
             }
+            
+            // Adjust the EXPANDED box to original image coordinates
+            // 1. Subtract padding to get coordinates relative to the resized image
+            // 2. Scale up to get coordinates relative to the original image
+            double centerX = (box.center.x - padLeft) * scale;
+            double centerY = (box.center.y - padTop) * scale;
+            double w = box.size.width * scale;
+            double h = box.size.height * scale;
+
+            Point center = new Point(centerX, centerY);
+            Size size = new Size(w, h);
+
+            RotatedRect scaledBox = new RotatedRect(center, size, box.angle);
+            validBoxes.add(scaledBox);
+
+            contour.release();
+            contour2f.release();
         }
+        probMapMat.release(); // free memory
+
+        return validBoxes;
     }
 
-    private void createDocx() {
-        String ocrText = getCombinedOcrText();
-        String fileName = "OCR_Result_" + System.currentTimeMillis() + ".docx";
-
-        ContentValues contentValues = new ContentValues();
-        contentValues.put(MediaStore.MediaColumns.DISPLAY_NAME, fileName);
-        contentValues.put(MediaStore.MediaColumns.MIME_TYPE, "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            contentValues.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
+    private List<RectF> groupBoundingBoxesIntoLines(List<RectF> boxes) {
+        if (boxes == null || boxes.isEmpty()) {
+            return new ArrayList<>();
         }
 
-        Uri uri = getContentResolver().insert(Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
-                ? MediaStore.Downloads.EXTERNAL_CONTENT_URI
-                : MediaStore.Files.getContentUri("external"), contentValues);
+        // 1. Sort boxes from top to bottom, then left to right
+        boxes.sort(Comparator.comparing((RectF rect) -> rect.top).thenComparing(rect -> rect.left));
 
-        if (uri != null) {
-            try (OutputStream outputStream = getContentResolver().openOutputStream(uri);
-                 XWPFDocument document = new XWPFDocument()) {
+        List<RectF> lines = new ArrayList<>();
+        
+        List<RectF> currentLineBoxes = new ArrayList<>();
+        currentLineBoxes.add(boxes.get(0));
 
-                String[] lines = ocrText.split("\n");
-                for (String line : lines) {
-                    XWPFParagraph paragraph = document.createParagraph();
-                    XWPFRun run = paragraph.createRun();
-                    run.setText(line);
+        // 2. Iterate and group based on vertical proximity
+        for (int i = 1; i < boxes.size(); i++) {
+            RectF currentBox = boxes.get(i);
+            // Use the last *added* box to the line for comparison, not the line's center
+            RectF lastBoxInLine = currentLineBoxes.get(currentLineBoxes.size() - 1); 
+
+            float lastBoxCenterY = lastBoxInLine.centerY();
+            float currentBoxCenterY = currentBox.centerY();
+            
+            // Use the height of the last box for tolerance check, as in the python script
+            float tolerance = lastBoxInLine.height() * 0.7f;
+
+            // Check if the vertical centers are close enough 
+            if (Math.abs(currentBoxCenterY - lastBoxCenterY) < tolerance) {
+                currentLineBoxes.add(currentBox);
+            } else {
+                // Finalize the previous line by creating a single bounding box for it.
+                if (!currentLineBoxes.isEmpty()) {
+                    RectF mergedLine = new RectF(currentLineBoxes.get(0));
+                    for (int j = 1; j < currentLineBoxes.size(); j++) {
+                        mergedLine.union(currentLineBoxes.get(j));
+                    }
+                    lines.add(mergedLine);
                 }
 
-                document.write(outputStream);
-                Toast.makeText(this, "Đã lưu DOCX vào thư mục Downloads.", Toast.LENGTH_LONG).show();
-            } catch (Exception e) {
-                Log.e("ExportDOCX", "Không thể tạo tệp DOCX", e);
-                Toast.makeText(this, "Lỗi khi lưu tệp DOCX.", Toast.LENGTH_SHORT).show();
+                // Start a new line
+                currentLineBoxes.clear();
+                currentLineBoxes.add(currentBox);
             }
         }
+
+        // 3. Add the last remaining line
+        if (!currentLineBoxes.isEmpty()) {
+            RectF mergedLine = new RectF(currentLineBoxes.get(0));
+            for (int j = 1; j < currentLineBoxes.size(); j++) {
+                mergedLine.union(currentLineBoxes.get(j));
+            }
+            lines.add(mergedLine);
+        }
+
+        return lines;
     }
 
     private FloatBuffer preprocessImageForRecognition(Bitmap bitmap) {
-        // Resize bitmap to 32x128 (Height x Width) as required by the model
-        Bitmap resizedBitmap = Bitmap.createScaledBitmap(bitmap, 128, 32, true);
+        return preprocessImageForRecognition(bitmap, 32, 128);
+    }
 
-        int width = resizedBitmap.getWidth();
-        int height = resizedBitmap.getHeight();
-        FloatBuffer floatBuffer = FloatBuffer.allocate(width * height * 3); // RGB channels
-        int[] intValues = new int[width * height];
-        resizedBitmap.getPixels(intValues, 0, width, 0, 0, width, height);
+    private FloatBuffer preprocessImageForRecognition(Bitmap bitmap, int targetHeight, int targetWidth) {
+        // This function uses a more generic pre-processing that also pads.
+        // The mean and std are for models normalized to [-1, 1] or [0, 1]
+        // For ViTSTR, it's typically [0, 1] and then normalized with mean/std 0.5/0.5
+        return preprocessImage(bitmap, targetWidth, targetHeight, new float[]{0.5f}, new float[]{0.5f});
+    }
 
-        for (int i = 0; i < intValues.length; ++i) {
-            final int val = intValues[i];
-            // Normalize to -1 to 1 range and handle channels
-            floatBuffer.put((((float) ((val >> 16) & 0xFF)) / 255.0f - 0.5f) / 0.5f); // Red
-            floatBuffer.put((((float) ((val >> 8) & 0xFF)) / 255.0f - 0.5f) / 0.5f);  // Green
-            floatBuffer.put((((float) (val & 0xFF)) / 255.0f - 0.5f) / 0.5f);         // Blue
+    private FloatBuffer preprocessImageForDetection(Bitmap bitmap, int targetSize, int newWidth, int newHeight, float[] mean, float[] std) {
+        Mat mat = new Mat();
+        Utils.bitmapToMat(bitmap, mat);
+
+        // Convert to RGB if it's RGBA
+        Imgproc.cvtColor(mat, mat, Imgproc.COLOR_RGBA2RGB);
+
+        // Resize the image, maintaining aspect ratio
+        Mat resizedMat = new Mat();
+        Imgproc.resize(mat, resizedMat, new Size(newWidth, newHeight), 0, 0, Imgproc.INTER_AREA);
+
+        // Create a black canvas of the target size
+        Mat canvasMat = Mat.zeros(targetSize, targetSize, CvType.CV_8UC3);
+
+        // Copy the resized image onto the center of the canvas
+        int top = (targetSize - newHeight) / 2;
+        int left = (targetSize - newWidth) / 2;
+
+        // --- START: ROI CRASH DIAGNOSIS ---
+        Log.e("OcrCrashDebug", "--- ROI Pre-Check Values ---");
+        Log.e("OcrCrashDebug", "targetSize = " + targetSize);
+        Log.e("OcrCrashDebug", "newWidth = " + newWidth + ", newHeight = " + newHeight);
+        Log.e("OcrCrashDebug", "left = " + left + ", top = " + top);
+        Log.e("OcrCrashDebug", "Check (left + newWidth <= targetSize): " + (left + newWidth) + " <= " + targetSize + " ? --> " + ((left + newWidth) <= targetSize));
+        Log.e("OcrCrashDebug", "Check (top + newHeight <= targetSize): " + (top + newHeight) + " <= " + targetSize + " ? --> " + ((top + newHeight) <= targetSize));
+        // --- END: ROI CRASH DIAGNOSIS ---
+
+        org.opencv.core.Rect roi = new org.opencv.core.Rect(left, top, newWidth, newHeight);
+        Mat subview = canvasMat.submat(roi);
+        resizedMat.copyTo(subview);
+
+        // Convert to float and scale to [0, 1]
+        canvasMat.convertTo(canvasMat, CvType.CV_32F, 1.0 / 255.0);
+
+        // Normalize using mean and std
+        Core.subtract(canvasMat, new Scalar(mean[0], mean[1], mean[2]), canvasMat);
+        Core.divide(canvasMat, new Scalar(std[0], std[1], std[2]), canvasMat);
+
+        // NCHW format for ONNX runtime
+        float[] floatArray = new float[targetSize * targetSize * 3];
+        canvasMat.get(0, 0, floatArray);
+        FloatBuffer floatBuffer = FloatBuffer.allocate(targetSize * targetSize * 3);
+
+        int stride = targetSize * targetSize;
+        for (int i = 0; i < stride; i++) {
+            floatBuffer.put(i, floatArray[i * 3]);             // R
+            floatBuffer.put(i + stride, floatArray[i * 3 + 1]); // G
+            floatBuffer.put(i + 2 * stride, floatArray[i * 3 + 2]); // B
         }
         floatBuffer.rewind();
+
+        // Cleanup
+        mat.release();
+        resizedMat.release();
+        canvasMat.release();
+        subview.release();
+
         return floatBuffer;
     }
 
-    private FloatBuffer preprocessImageForDetection(Bitmap bitmap) {
-        // Resize bitmap to a common detection model input size, e.g., 640x640
-        Bitmap resizedBitmap = Bitmap.createScaledBitmap(bitmap, 640, 640, true);
+    private FloatBuffer preprocessImage(Bitmap bitmap, int targetWidth, int targetHeight, float[] mean, float[] std) {
+        Mat mat = new Mat();
+        Utils.bitmapToMat(bitmap, mat);
+        Imgproc.cvtColor(mat, mat, Imgproc.COLOR_RGBA2RGB);
 
-        int width = resizedBitmap.getWidth();
-        int height = resizedBitmap.getHeight();
-        FloatBuffer floatBuffer = FloatBuffer.allocate(width * height * 3); // RGB channels
-        int[] intValues = new int[width * height];
-        resizedBitmap.getPixels(intValues, 0, width, 0, 0, width, height);
+        // Resize and pad
+        int h = mat.rows();
+        int w = mat.cols();
 
-        // Normalize pixel values to 0-1 range
-        for (int i = 0; i < intValues.length; ++i) {
-            final int val = intValues[i];
-            floatBuffer.put(((float) ((val >> 16) & 0xFF)) / 255.0f); // Red
-            floatBuffer.put(((float) ((val >> 8) & 0xFF)) / 255.0f);  // Green
-            floatBuffer.put(((float) (val & 0xFF)) / 255.0f);         // Blue
+        if (h == 0 || w == 0) {
+            // Cannot process a zero-sized image. Return an empty buffer.
+            return FloatBuffer.allocate(targetWidth * targetHeight * 3);
+        }
+
+        float scaleW = (float) targetWidth / w;
+        float scaleH = (float) targetHeight / h;
+        float scale = Math.min(scaleW, scaleH);
+
+        int targetW = (int) (w * scale);
+        int targetH = (int) (h * scale);
+
+        // Safeguard against dimensions becoming zero after calculation.
+        if (targetW <= 0) targetW = 1;
+        if (targetH <= 0) targetH = 1;
+
+        Mat resized = new Mat();
+        Imgproc.resize(mat, resized, new Size(targetW, targetH), 0, 0, Imgproc.INTER_AREA);
+
+        Mat finalMat = new Mat(targetHeight, targetWidth, resized.type(), new Scalar(0, 0, 0)); // Black padding
+        int top = (targetHeight - targetH) / 2;
+        int left = (targetWidth - targetW) / 2;
+        org.opencv.core.Rect roi = new org.opencv.core.Rect(left, top, targetW, targetH);
+        Mat subview = finalMat.submat(roi);
+        resized.copyTo(subview);
+
+        // Convert to float and normalize
+        finalMat.convertTo(finalMat, CvType.CV_32F, 1.0 / 255.0);
+        Core.subtract(finalMat, new Scalar(mean[0], mean[0], mean[0]), finalMat); // Assuming single value for mean/std
+        Core.divide(finalMat, new Scalar(std[0], std[0], std[0]), finalMat);
+
+
+        // NCHW
+        float[] floatArray = new float[targetWidth * targetHeight * 3];
+        finalMat.get(0, 0, floatArray);
+        FloatBuffer floatBuffer = FloatBuffer.allocate(targetWidth * targetHeight * 3);
+
+
+        int stride = targetWidth * targetHeight;
+        for (int i = 0; i < stride; i++) {
+            floatBuffer.put(i, floatArray[i * 3]); // R
+            floatBuffer.put(i + stride, floatArray[i * 3 + 1]); // G
+            floatBuffer.put(i + 2 * stride, floatArray[i * 3 + 2]); // B
         }
         floatBuffer.rewind();
+
+        mat.release();
+        resized.release();
+        finalMat.release();
+        subview.release();
+
         return floatBuffer;
-    }
-
-    private void performOcrForImage(Uri imageUri, final int position, int userId) {
-        // Add null checks for ONNX Runtime sessions
-        if (ortSession == null || detectionSession == null || englishRecognitionSession == null) {
-            runOnUiThread(() -> updateOcrResult(position, getString(R.string.failed_to_process_image, "ONNX Runtime sessions not initialized. Please restart the app."), false));
-            triggerNextImageProcessing();
-            return;
-        }
-
-        try (InputStream iStream = getContentResolver().openInputStream(imageUri)) {
-            if (iStream == null) throw new IOException("Unable to open InputStream.");
-            Bitmap originalBitmap = BitmapFactory.decodeStream(iStream);
-
-            if (originalBitmap == null) {
-                runOnUiThread(() -> updateOcrResult(position, getString(R.string.failed_to_process_image, "Could not decode image."), false));
-                triggerNextImageProcessing();
-                return;
-            }
-
-            // --- TEXT DETECTION STEP ---
-            FloatBuffer detectionInputBuffer = preprocessImageForDetection(originalBitmap);
-            long[] detectionInputShape = {1, 3, 640, 640}; // Batch size 1, 3 channels, 640 height, 640 width
-            java.util.Map<String, OnnxTensor> detectionInputs = new java.util.HashMap<>();
-            detectionInputs.put(new ArrayList<>(detectionSession.getInputNames()).get(0), OnnxTensor.createTensor(ortEnv, detectionInputBuffer, detectionInputShape));
-
-            // Run detection model
-            OrtSession.Result detectionResult = detectionSession.run(detectionInputs);
-
-            // Process detection output
-            OnnxTensor detectionOutput = (OnnxTensor) detectionResult.get(new ArrayList<>(detectionSession.getOutputNames()).get(0)).get();
-            FloatBuffer detectionOutputBuffer = detectionOutput.getFloatBuffer();
-            // TODO: Parse detectionResult to get bounding boxes of text
-            // For now, we will assume one full image detection for simplicity.
-            // This part will be expanded in the next steps.
-            detectionResult.close(); // Close detection result
-
-            // --- RECOGNITION STEP (using the whole image as a single text line for now) ---
-            // This part will be iterated over detected bounding boxes in the next steps.
-            FloatBuffer recognitionInputData = preprocessImageForRecognition(originalBitmap);
-
-            long[] recognitionInputShape = {1, 3, 32, 128}; // Batch size 1, 3 channels, 32 height, 128 width
-            java.util.Map<String, OnnxTensor> recognitionInputs = new java.util.HashMap<>();
-            recognitionInputs.put(new ArrayList<>(ortSession.getInputNames()).get(0), OnnxTensor.createTensor(ortEnv, recognitionInputData, recognitionInputShape));
-
-            // Determine which recognition model to use based on language selection
-            OrtSession currentRecognitionSession;
-            Vocab currentVocab;
-            if (radioVietnamese.isChecked()) {
-                currentRecognitionSession = ortSession;
-                currentVocab = vietnameseVocab;
-            } else {
-                currentRecognitionSession = englishRecognitionSession;
-                currentVocab = englishVocab;
-            }
-
-            // Run recognition model
-            OrtSession.Result recognitionResult = currentRecognitionSession.run(recognitionInputs);
-            OnnxTensor recognitionOutput = (OnnxTensor) recognitionResult.get(new ArrayList<>(currentRecognitionSession.getOutputNames()).get(0)).get();
-            long[] outputShape = (long[]) recognitionOutput.getInfo().getShape(); // Shape is [batch_size, seq_len, vocab_size]
-            float[] outputData = recognitionOutput.getFloatBuffer().array();
-
-            // Decode the logits to text
-            int seqLen = (int) outputShape[1];
-            int vocabSize = (int) outputShape[2];
-            int[] predictedCharIds = new int[seqLen];
-
-            for (int i = 0; i < seqLen; i++) {
-                int bestCharIndex = -1;
-                float maxLogit = Float.MIN_VALUE;
-                for (int j = 0; j < vocabSize; j++) {
-                    float currentLogit = outputData[i * vocabSize + j];
-                    if (currentLogit > maxLogit) {
-                        maxLogit = currentLogit;
-                        bestCharIndex = j;
-                    }
-                }
-                predictedCharIds[i] = bestCharIndex;
-            }
-
-            String recognizedText = currentVocab.decode(predictedCharIds);
-
-            runOnUiThread(() -> updateOcrResult(position, recognizedText, false));
-            recognitionResult.close(); // Close the recognition result to free resources
-
-        } catch (Exception e) {
-            Log.e("MainActivity", "Error during ONNX inference: " + e.getMessage());
-            runOnUiThread(() -> updateOcrResult(position, getString(R.string.failed_to_process_image, e.getMessage()), false));
-        } finally {
-            // Make sure to close current OCR call if it was an HTTP one (before modification)
-            if (currentOcrCall != null && !currentOcrCall.isCanceled()) {
-                currentOcrCall.cancel();
-            }
-            triggerNextImageProcessing();
-        }
     }
 
     private void updateOcrResult(int position, String text, boolean isProcessing) {
+        updateOcrResult(position, text, isProcessing, null);
+    }
+
+    private void updateOcrResult(int position, String text, boolean isProcessing, Bitmap preview) {
         if (position >= 0 && position < ocrResultList.size()) {
             OcrResult result = ocrResultList.get(position);
-            result.setRecognizedText(text);
+            result.setText(text);
             result.setProcessing(isProcessing);
+            if (preview != null) {
+                result.setPreviewWithBoxes(preview);
+            }
             ocrResultAdapter.notifyItemChanged(position);
         }
     }
 
     private void triggerNextImageProcessing() {
-        runOnUiThread(this::processNextImage);
+        currentOcrIndex++;
+        progressBar.setProgress((int) (((float) currentOcrIndex / imageUris.size()) * 100));
+        processNextImage();
     }
-
+    
     private void setLocale(String langCode) {
+        SharedPreferences.Editor editor = getSharedPreferences("settings", MODE_PRIVATE).edit();
+        editor.putString("lang", langCode);
+        editor.apply();
         Locale locale = new Locale(langCode);
         Locale.setDefault(locale);
-        Configuration config = new Configuration();
+        Configuration config = getResources().getConfiguration();
         config.setLocale(locale);
         getResources().updateConfiguration(config, getResources().getDisplayMetrics());
     }
 
     private void updateTexts() {
-        btnRunOcr.setText(getString(R.string.run_ocr));
-        btnExport.setText(getString(R.string.export));
-        tvSelectLanguage.setText(getString(R.string.select_document_language));
+        setTitle(getString(R.string.app_name));
+        tvSelectLanguage.setText("Select Language"); // Hardcoded to fix build error
         radioVietnamese.setText(getString(R.string.vietnamese));
         radioEnglish.setText(getString(R.string.english));
         tvDeleteInstruction.setText(getString(R.string.long_press_to_delete));
+        // Update more texts if needed
     }
 
     private void setupNavigationDrawer() {
+        NavigationView navigationView = findViewById(R.id.nav_view);
+        View headerView = navigationView.getHeaderView(0);
+        // ... find views in header ...
+        
         if (isLoggedIn) {
+            // Show user info, hide guest view
             guestViewNav.setVisibility(View.GONE);
-            historyRecyclerViewNav.setVisibility(View.VISIBLE);
             fetchHistory();
         } else {
+            // Show guest view
             guestViewNav.setVisibility(View.VISIBLE);
-            historyRecyclerViewNav.setVisibility(View.GONE);
         }
 
-        btnNewSession.setOnClickListener(v -> {
-            startNewOcrSession();
-            drawerLayout.closeDrawers();
-        });
-
         btnLoginNav.setOnClickListener(v -> {
-            Intent intent = new Intent(MainActivity.this, LoginActivity.class);
-            startActivity(intent);
+            // Handle login
+        });
+        
+        btnNewSession.setOnClickListener(v -> startNewOcrSession());
+
+        navigationView.setNavigationItemSelectedListener(item -> {
+            // Handle navigation view item clicks here.
+            drawerLayout.closeDrawers();
+            return true;
         });
     }
 
     private void fetchHistory() {
         if (userId == -1) return;
-
+        
         Request request = new Request.Builder()
                 .url(BASE_URL + "/history/" + userId)
-                .get()
                 .build();
-
+                
         client.newCall(request).enqueue(new Callback() {
             @Override
             public void onFailure(@NonNull Call call, @NonNull IOException e) {
-                // Handle failure (e.g., show a toast)
-                runOnUiThread(() -> Toast.makeText(MainActivity.this, "Failed to load history", Toast.LENGTH_SHORT).show());
+                runOnUiThread(() -> Toast.makeText(MainActivity.this, "Failed to fetch history.", Toast.LENGTH_SHORT).show());
             }
 
             @Override
             public void onResponse(@NonNull Call call, @NonNull Response response) throws IOException {
-                if (!response.isSuccessful()) {
-                    runOnUiThread(() -> Toast.makeText(MainActivity.this, "History fetch failed: " + response.code(), Toast.LENGTH_SHORT).show());
-                    return;
-                }
+                if (response.isSuccessful()) {
+                    final String jsonResponse = response.body().string();
+                    try {
+                        JSONObject jsonObj = new JSONObject(jsonResponse);
+                        JSONArray sessionsArray = jsonObj.getJSONArray("sessions");
+                        historySessionList.clear();
+                        for (int i = 0; i < sessionsArray.length(); i++) {
+                            JSONObject sessionObj = sessionsArray.getJSONObject(i);
+                            String sessionName = sessionObj.getString("session_name");
+                            String createdAt = sessionObj.getString("created_at");
 
-                final String responseData = response.body().string();
-                try {
-                    JSONArray sessionsArray = new JSONArray(responseData);
-                    historySessionList.clear();
+                            List<HistoryItemDetail> details = new ArrayList<>();
+                            List<Integer> imageIds = new ArrayList<>();
+                            JSONArray imagesArray = sessionObj.getJSONArray("images");
 
-                    for (int i = 0; i < sessionsArray.length(); i++) {
-                        JSONObject sessionObject = sessionsArray.getJSONObject(i);
-                        String timestamp = sessionObject.getString("timestamp");
-                        int imageCount = sessionObject.getInt("image_count");
-
-                        // --- NEW: Extract image_ids for deletion ---
-                        JSONArray imageIdsArray = sessionObject.getJSONArray("image_ids");
-                        List<Integer> imageIds = new ArrayList<>();
-                        for (int j = 0; j < imageIdsArray.length(); j++) {
-                            imageIds.add(imageIdsArray.getInt(j));
-                        }
-                        // ---
-
-                        JSONArray resultsArray = sessionObject.getJSONArray("results");
-                        List<HistoryItemDetail> details = new ArrayList<>();
-                        for (int j = 0; j < resultsArray.length(); j++) {
-                            JSONObject resultObject = resultsArray.getJSONObject(j);
-                            String base64Image = resultObject.getString("image_base64");
-                            String text = resultObject.getString("text");
-                            Uri imageUri = saveBase64ImageToTempFile(base64Image, "history_" + userId + "_" + i + "_" + j);
-                            if (imageUri != null) {
-                                details.add(new HistoryItemDetail(imageUri, text));
+                            for(int j=0; j<imagesArray.length(); j++){
+                                JSONObject imageObj = imagesArray.getJSONObject(j);
+                                int imageId = imageObj.getInt("image_id");
+                                String base64 = imageObj.getString("base64_string");
+                                String recognizedText = imageObj.optString("recognized_text", "N/A");
+                                
+                                Uri imageUri = saveBase64ImageToTempFile(base64, String.valueOf(imageId));
+                                if(imageUri != null) {
+                                    details.add(new HistoryItemDetail(imageUri, recognizedText));
+                                    imageIds.add(imageId);
+                                }
                             }
+                            historySessionList.add(new HistorySession(sessionName, imagesArray.length(), details, imageIds));
                         }
-                        historySessionList.add(new HistorySession(timestamp, imageCount, details, imageIds));
+                        
+                        runOnUiThread(() -> historyAdapterNav.notifyDataSetChanged());
+                        
+                    } catch (JSONException e) {
+                         runOnUiThread(() -> Toast.makeText(MainActivity.this, "Error parsing history.", Toast.LENGTH_SHORT).show());
                     }
-
-                    runOnUiThread(() -> {
-                        historyAdapterNav.setSessions(historySessionList);
-                        historyRecyclerViewNav.setVisibility(View.VISIBLE);
-                    });
-
-                } catch (JSONException e) {
-                    runOnUiThread(() -> Toast.makeText(MainActivity.this, "Failed to parse history", Toast.LENGTH_SHORT).show());
                 }
             }
         });
@@ -819,120 +1117,150 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
 
     private Uri saveBase64ImageToTempFile(String base64String, String uniqueId) {
         try {
-            byte[] decodedString = Base64.decode(base64String, Base64.DEFAULT);
-            File tempFile = File.createTempFile("history_" + uniqueId + "_", ".jpg", getCacheDir());
-            FileOutputStream fos = new FileOutputStream(tempFile);
-            fos.write(decodedString);
-            fos.close();
+            final byte[] imageBytes = Base64.decode(base64String, Base64.DEFAULT);
+            File outputDir = getCacheDir();
+            File tempFile = File.createTempFile("history_" + uniqueId, ".jpg", outputDir);
+            try (FileOutputStream fos = new FileOutputStream(tempFile)) {
+                fos.write(imageBytes);
+            }
             return Uri.fromFile(tempFile);
         } catch (IOException e) {
-            e.printStackTrace();
+            Log.e("History", "Error saving base64 image to temp file", e);
             return null;
         }
     }
-
+    
     @Override
     public void onImageClick(Uri imageUri) {
-        // When an image in the recycler view is clicked, open it in the viewer for editing
-        int position = imageUris.indexOf(imageUri);
-        Intent intent = new Intent(this, ImageViewerActivity.class);
-        intent.setData(imageUri);
-        intent.putExtra("image_position", position);
-        imageViewerLauncher.launch(intent);
+        int clickedPosition = imageUris.indexOf(imageUri);
+        if (clickedPosition != -1) {
+            Intent intent = new Intent(this, ImageViewerActivity.class);
+            intent.putParcelableArrayListExtra("image_uris", new ArrayList<>(imageUris));
+            intent.putExtra("selected_position", clickedPosition);
+            imageViewerLauncher.launch(intent);
+        }
     }
-
+    
     @Override
     public void onSessionClick(HistorySession session) {
-        // Load session results into the main OCR result view
+        imageUris.clear();
         ocrResultList.clear();
-        for (HistoryItemDetail detail : session.getDetails()) {
-            ocrResultList.add(new OcrResult(detail.getImageUri(), detail.getRecognizedText(), false));
+        
+        if (session.getDetails() != null) {
+            for(HistoryItemDetail detail : session.getDetails()){
+                Uri uri = detail.getImageUri();
+                if(uri != null){
+                    imageUris.add(uri);
+                    ocrResultList.add(new OcrResult(uri, detail.getRecognizedText(), false));
+                }
+            }
         }
-        ocrResultAdapter.setOcrResults(ocrResultList);
+        
+        imageAdapter.notifyDataSetChanged();
+        ocrResultAdapter.notifyDataSetChanged();
+        updateDeleteInstructionVisibility();
         drawerLayout.closeDrawers();
     }
-
+    
     @Override
     public void onDeleteSessionClick(HistorySession session, final int position) {
         new AlertDialog.Builder(this)
-            .setTitle(R.string.delete_session_confirmation_title)
-            .setMessage(R.string.delete_session_confirmation_message)
-            .setPositiveButton(R.string.yes, (dialog, which) -> {
-                sendDeleteSessionRequest(session.getImageIds(), position);
+            .setTitle("Delete Session")
+            .setMessage("Are you sure you want to delete this session?")
+            .setPositiveButton("Delete", (dialog, which) -> {
+                List<Integer> imageIds = session.getImageIds();
+                if (imageIds != null && !imageIds.isEmpty()) {
+                    sendDeleteSessionRequest(imageIds, position);
+                } else {
+                    // Fallback or error handling if needed, for now just remove from list
+                    historySessionList.remove(position);
+                    historyAdapterNav.notifyItemRemoved(position);
+                    historyAdapterNav.notifyItemRangeChanged(position, historySessionList.size());
+                }
             })
-            .setNegativeButton(R.string.no, null)
+            .setNegativeButton("Cancel", null)
             .show();
     }
 
     private void sendDeleteSessionRequest(List<Integer> imageIds, final int position) {
-        if (imageIds == null || imageIds.isEmpty()) {
-            Toast.makeText(this, "Error: No images to delete.", Toast.LENGTH_SHORT).show();
-            return;
-        }
-
         JSONObject json = new JSONObject();
         try {
             json.put("image_ids", new JSONArray(imageIds));
         } catch (JSONException e) {
-            Toast.makeText(this, "Error creating delete request.", Toast.LENGTH_SHORT).show();
+            // Should not happen
             return;
         }
 
         RequestBody body = RequestBody.create(json.toString(), MediaType.get("application/json; charset=utf-8"));
         Request request = new Request.Builder()
-                .url(BASE_URL + "/history/delete")
+                .url(BASE_URL + "/delete_images")
                 .post(body)
                 .build();
-
+        
         client.newCall(request).enqueue(new Callback() {
             @Override
             public void onFailure(@NonNull Call call, @NonNull IOException e) {
-                runOnUiThread(() -> Toast.makeText(MainActivity.this, "Failed to delete session: " + e.getMessage(), Toast.LENGTH_SHORT).show());
+                 runOnUiThread(() -> Toast.makeText(MainActivity.this, "Failed to delete session.", Toast.LENGTH_SHORT).show());
             }
 
             @Override
             public void onResponse(@NonNull Call call, @NonNull Response response) throws IOException {
                 if (response.isSuccessful()) {
+                    final String responseBody = response.body().string();
                     runOnUiThread(() -> {
-                        if (position >= 0 && position < historySessionList.size()) {
-                            historySessionList.remove(position);
-                            historyAdapterNav.notifyItemRemoved(position);
-                            historyAdapterNav.notifyItemRangeChanged(position, historySessionList.size());
-                            Toast.makeText(MainActivity.this, "Session deleted.", Toast.LENGTH_SHORT).show();
+                        try {
+                            JSONObject json = new JSONObject(responseBody);
+                            if (json.has("message") && json.getString("message").equals("Session deleted successfully")) {
+                                historySessionList.remove(position);
+                                historyAdapterNav.notifyItemRemoved(position);
+                                historyAdapterNav.notifyItemRangeChanged(position, historySessionList.size());
+                                Toast.makeText(MainActivity.this, getString(R.string.session_deleted), Toast.LENGTH_SHORT).show();
+                            } else {
+                                Toast.makeText(MainActivity.this, "Failed: " + json.optString("error", "Unknown error"), Toast.LENGTH_SHORT).show();
+                            }
+                        } catch (JSONException e) {
+                            Log.e("MainActivity", "JSON parsing error after delete", e);
+                            Toast.makeText(MainActivity.this, "Error parsing delete response", Toast.LENGTH_SHORT).show();
                         }
                     });
                 } else {
-                    final String errorBody = response.body().string();
-                    runOnUiThread(() -> Toast.makeText(MainActivity.this, "Error deleting session: " + errorBody, Toast.LENGTH_LONG).show());
+                    runOnUiThread(() -> Toast.makeText(MainActivity.this, "Delete failed: " + response.message(), Toast.LENGTH_SHORT).show());
                 }
             }
         });
     }
 
     private void startNewOcrSession() {
-        // Clear the selected images
+        // Clear current OCR data
         imageUris.clear();
-        imageAdapter.setImageUris(imageUris);
-
-        // Clear the displayed OCR results
         ocrResultList.clear();
-        ocrResultAdapter.setOcrResults(ocrResultList);
+        imageAdapter.notifyDataSetChanged();
+        ocrResultAdapter.notifyDataSetChanged();
+        currentOcrIndex = -1;
+        stopOcrRequested = false;
+
+        // Reset UI elements
+        btnRunOcr.setVisibility(View.VISIBLE);
+        btnStopOcr.setVisibility(View.GONE);
+        progressBar.setVisibility(View.GONE);
 
         // Close the drawer
-        drawerLayout.closeDrawers();
-    }
-
-    private void adjustNavDrawerForStatusBar() {
-        View spacer = findViewById(R.id.status_bar_spacer);
-        int statusBarHeight = 0;
-        int resourceId = getResources().getIdentifier("status_bar_height", "dimen", "android");
-        if (resourceId > 0) {
-            statusBarHeight = getResources().getDimensionPixelSize(resourceId);
+        if (drawerLayout.isDrawerOpen(findViewById(R.id.nav_view))) {
+            drawerLayout.closeDrawer(findViewById(R.id.nav_view));
         }
-        LinearLayout.LayoutParams params = (LinearLayout.LayoutParams) spacer.getLayoutParams();
-        params.height = statusBarHeight;
-        // Set the height of the spacer
-        spacer.setLayoutParams(params);
+        Toast.makeText(this, getString(R.string.new_session_started), Toast.LENGTH_SHORT).show();
+    }
+    
+    private void adjustNavDrawerForStatusBar() {
+        // This is a common method to adjust navigation drawer padding for transparent status bars.
+    }
+    
+    private void updateDeleteInstructionVisibility() {
+        if (!imageUris.isEmpty()) {
+            tvDeleteInstruction.setVisibility(View.VISIBLE);
+        } else {
+            tvDeleteInstruction.setVisibility(View.GONE);
+        }
     }
 
     public byte[] getBytes(InputStream inputStream) throws IOException {
@@ -948,85 +1276,256 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
     }
 
     private void showStopOcrConfirmationDialog() {
+        if (!progressBar.isIndeterminate()) {
+            return; // Not running
+        }
         new AlertDialog.Builder(this)
-                .setTitle(R.string.stop_ocr_title)
-                .setMessage(R.string.stop_ocr_confirmation)
-                .setPositiveButton(R.string.yes, (dialog, which) -> {
+                .setTitle("Stop OCR")
+                .setMessage("Are you sure you want to stop the current OCR process?")
+                .setPositiveButton("Stop", (dialog, which) -> {
                     stopOcrRequested = true;
-                    if (currentOcrCall != null && !currentOcrCall.isCanceled()) {
+                    if(currentOcrCall != null && !currentOcrCall.isCanceled()){
                         currentOcrCall.cancel();
                     }
-                    updateOcrUiState(false);
-                    Toast.makeText(MainActivity.this, R.string.ocr_stopped_message, Toast.LENGTH_SHORT).show();
                 })
-                .setNegativeButton(R.string.no, null)
+                .setNegativeButton("Cancel", null)
                 .show();
     }
-
+    
     private void updateOcrUiState(boolean isRunning) {
-        if (isRunning) {
-            btnRunOcr.setVisibility(View.GONE);
-            btnStopOcr.setVisibility(View.VISIBLE);
-            progressBar.setVisibility(View.VISIBLE);
-            progressBar.setIndeterminate(false); // We will set progress manually
-        } else {
-            btnRunOcr.setVisibility(View.VISIBLE);
-            btnStopOcr.setVisibility(View.GONE);
-            progressBar.setVisibility(View.GONE);
+        progressBar.setIndeterminate(isRunning);
+        progressBar.setVisibility(isRunning ? View.VISIBLE : View.GONE);
+        if(isRunning){
             progressBar.setProgress(0);
-            currentOcrCall = null;
         }
+        btnRunOcr.setEnabled(!isRunning);
+        btnStopOcr.setEnabled(isRunning);
+        btnExport.setEnabled(!isRunning && !ocrResultList.isEmpty());
+        fab.setEnabled(!isRunning);
     }
-
+    
     @Override
     public void onImageLongClick(Uri imageUri) {
         new AlertDialog.Builder(this)
-                .setTitle(R.string.delete_image_title)
-                .setMessage(R.string.delete_image_confirmation)
-                .setPositiveButton(R.string.delete, (dialog, which) -> {
-                    int position = imageUris.indexOf(imageUri);
-                    if (position != -1) {
-                        imageUris.remove(position);
-                        imageAdapter.notifyItemRemoved(position);
-                        imageAdapter.notifyItemRangeChanged(position, imageUris.size());
+            .setTitle("Delete Image")
+            .setMessage("Are you sure you want to remove this image from the list?")
+            .setPositiveButton("Delete", (dialog, which) -> {
+                int position = imageUris.indexOf(imageUri);
+                if (position != -1) {
+                    imageUris.remove(position);
+                    imageAdapter.notifyItemRemoved(position);
+                    imageAdapter.notifyItemRangeChanged(position, imageUris.size());
+                    updateDeleteInstructionVisibility();
+                    
+                    // Also remove the corresponding ocr result if it exists
+                    if(position < ocrResultList.size()){
+                        ocrResultList.remove(position);
+                        ocrResultAdapter.notifyItemRemoved(position);
+                        ocrResultAdapter.notifyItemRangeChanged(position, ocrResultList.size());
                     }
-                })
-                .setNegativeButton(R.string.cancel, null)
-                .show();
+                }
+            })
+            .setNegativeButton("Cancel", null)
+            .show();
     }
 
     @Override
     protected void onDestroy() {
         super.onDestroy();
+        // Close OrtSession and OrtEnvironment to free resources
         try {
-            if (ortSession != null) {
-                ortSession.close();
-            }
-            if (detectionSession != null) {
-                detectionSession.close();
-            }
-            if (englishRecognitionSession != null) {
-                englishRecognitionSession.close();
-            }
-            if (ortEnv != null) {
-                ortEnv.close();
-            }
+            if (ortSession != null) ortSession.close();
+            if (detectionSession != null) detectionSession.close();
+            if (englishRecognitionSession != null) englishRecognitionSession.close();
+            if (ortEnv != null) ortEnv.close();
         } catch (Exception e) {
-            Log.e("MainActivity", "Error closing ONNX Runtime sessions: " + e.getMessage());
+            Log.e("MainActivity", "Error closing ONNX Runtime resources.", e);
+        }
+    }
+    
+    private String assetFilePath(String assetName) throws IOException {
+        File file = new File(this.getCacheDir(), assetName);
+        if (file.exists() && file.length() > 0) {
+            return file.getAbsolutePath();
+        }
+
+        try (InputStream is = this.getAssets().open(assetName);
+             OutputStream os = new FileOutputStream(file)) {
+            byte[] buffer = new byte[4 * 1024];
+            int read;
+            while ((read = is.read(buffer)) != -1) {
+                os.write(buffer, 0, read);
+            }
+            os.flush();
+        }
+        return file.getAbsolutePath();
+    }
+
+    private void exportRecognizedText() {
+        if (ocrResultList == null || ocrResultList.stream().allMatch(r -> r.getText() == null || r.getText().isEmpty())) {
+            Toast.makeText(this, "No OCR results to export.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+                ActivityCompat.requestPermissions(this, new String[]{Manifest.permission.WRITE_EXTERNAL_STORAGE}, REQUEST_WRITE_STORAGE_PERMISSION);
+                return; 
+            }
+        }
+        
+        showExportFormatDialog();
+    }
+    
+    private void showExportFormatDialog() {
+        AlertDialog.Builder builder = new AlertDialog.Builder(this);
+        builder.setTitle("Choose Export Format");
+        String[] formats = {"PDF", "DOCX"};
+        builder.setItems(formats, (dialog, which) -> {
+            if (which == 0) {
+                exportToFile("pdf");
+            } else {
+                exportToFile("docx");
+            }
+        });
+        builder.show();
+    }
+    
+    private void exportToFile(String format) {
+        StringBuilder fullText = new StringBuilder();
+        for (OcrResult result : ocrResultList) {
+            if (result.getText() != null && !result.getText().isEmpty()) {
+                fullText.append(result.getText()).append("\n\n");
+            }
+        }
+    
+        if (fullText.length() == 0) {
+            Toast.makeText(this, "No text to export.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+    
+        try {
+            String fileName = "OCR_Result_" + System.currentTimeMillis() + "." + format;
+            ContentValues values = new ContentValues();
+            values.put(MediaStore.MediaColumns.DISPLAY_NAME, fileName);
+            values.put(MediaStore.MediaColumns.IS_PENDING, 1);
+    
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                values.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
+            }
+    
+            Uri collection = MediaStore.Files.getContentUri("external");
+            Uri itemUri = getContentResolver().insert(collection, values);
+    
+            if (itemUri == null) throw new IOException("Failed to create new MediaStore entry.");
+    
+            try (OutputStream os = getContentResolver().openOutputStream(itemUri)) {
+                if (os == null) throw new IOException("Failed to get output stream.");
+    
+                if ("pdf".equals(format)) {
+                    values.put(MediaStore.MediaColumns.MIME_TYPE, "application/pdf");
+                    Document document = new Document();
+                    PdfWriter.getInstance(document, os);
+                    document.open();
+                    
+                    try {
+                        InputStream fontStream = getAssets().open("fonts/vuTimes.ttf");
+                        byte[] fontBytes = getBytes(fontStream);
+                        BaseFont bf = BaseFont.createFont("vuTimes.ttf", BaseFont.IDENTITY_H, BaseFont.EMBEDDED, false, fontBytes, null);
+                        Font font = new Font(bf, 12);
+                        document.add(new Paragraph(fullText.toString(), font));
+                    } catch (IOException e) {
+                         Log.w("Export", "Vietnamese font not found, falling back to default.", e);
+                         document.add(new Paragraph(fullText.toString()));
+                    }
+    
+                    document.close();
+    
+                } else if ("docx".equals(format)) {
+                    values.put(MediaStore.MediaColumns.MIME_TYPE, "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+                    XWPFDocument document = new XWPFDocument();
+                    String[] lines = fullText.toString().split("\n");
+                    for (String line : lines) {
+                        XWPFParagraph paragraph = document.createParagraph();
+                        XWPFRun run = paragraph.createRun();
+                        run.setText(line);
+                    }
+                    document.write(os);
+                }
+            }
+            
+            values.clear();
+            values.put(MediaStore.MediaColumns.IS_PENDING, 0);
+            getContentResolver().update(itemUri, values, null, null);
+    
+            Toast.makeText(this, "Exported successfully to Downloads", Toast.LENGTH_LONG).show();
+    
+        } catch (Exception e) {
+            Log.e("MainActivity", "Error exporting file", e);
+            Toast.makeText(this, "Error exporting file: " + e.getMessage(), Toast.LENGTH_LONG).show();
         }
     }
 
-    private byte[] readBytesFromAsset(String assetFileName) throws IOException {
-        InputStream is = getAssets().open(assetFileName);
-        ByteArrayOutputStream buffer = new ByteArrayOutputStream();
-        int nRead;
-        byte[] data = new byte[16384]; // 16KB buffer
-
-        while ((nRead = is.read(data, 0, data.length)) != -1) {
-            buffer.write(data, 0, nRead);
+    private void saveSessionToHistory() {
+        if (userId == -1 || ocrResultList.isEmpty()) {
+            return;
         }
-        buffer.flush();
-        is.close();
-        return buffer.toByteArray();
+
+        JSONObject sessionData = new JSONObject();
+        try {
+            sessionData.put("user_id", userId);
+            JSONArray imagesArray = new JSONArray();
+
+            for (OcrResult ocrResult : ocrResultList) {
+                if(ocrResult.isProcessing()) continue; // Don't save incomplete results
+
+                try {
+                    // Convert Uri to Base64
+                    InputStream inputStream = getContentResolver().openInputStream(ocrResult.getImageUri());
+                    byte[] imageBytes = getBytes(inputStream);
+                    String base64Image = Base64.encodeToString(imageBytes, Base64.DEFAULT);
+
+                    JSONObject imageData = new JSONObject();
+                    imageData.put("base64_string", base64Image);
+                    imageData.put("recognized_text", ocrResult.getText());
+                    imagesArray.put(imageData);
+                } catch (IOException e) {
+                    Log.e("MainActivity", "Failed to process image for history", e);
+                }
+            }
+            sessionData.put("images", imagesArray);
+            sessionData.put("session_name", "OCR Session " + System.currentTimeMillis());
+
+        } catch (JSONException e) {
+            Log.e("MainActivity", "Failed to create JSON for history", e);
+            return;
+        }
+
+        RequestBody body = RequestBody.create(sessionData.toString(), MediaType.get("application/json; charset=utf-8"));
+        Request request = new Request.Builder()
+                .url(BASE_URL + "/add_session") // Assuming this endpoint
+                .post(body)
+                .build();
+
+        client.newCall(request).enqueue(new Callback() {
+            @Override
+            public void onFailure(@NonNull Call call, @NonNull IOException e) {
+                runOnUiThread(() -> Toast.makeText(MainActivity.this, "Failed to save session to history.", Toast.LENGTH_SHORT).show());
+            }
+
+            @Override
+            public void onResponse(@NonNull Call call, @NonNull Response response) throws IOException {
+                if (response.isSuccessful()) {
+                    runOnUiThread(() -> {
+                        Toast.makeText(MainActivity.this, "Session saved.", Toast.LENGTH_SHORT).show();
+                        // Optionally, refresh history view
+                        fetchHistory();
+                    });
+                } else {
+                    final String errorBody = response.body().string();
+                    runOnUiThread(() -> Toast.makeText(MainActivity.this, "Failed to save session: " + errorBody, Toast.LENGTH_SHORT).show());
+                }
+            }
+        });
     }
 }
