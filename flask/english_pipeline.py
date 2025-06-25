@@ -9,7 +9,7 @@ from doctr.io import DocumentFile
 import logging
 import sys
 import math
-from pipeline_utils import correct_perspective, deskew_image, remove_horizontal_lines
+from pipeline_utils import remove_horizontal_lines, correct_perspective
 
 # Set up logging to force output to console
 for handler in logging.root.handlers[:]:
@@ -105,10 +105,16 @@ def ocr_pipeline(pil_img):
         return "Please upload an image.", None, None, None, None
 
     try:
-        # Step 1-3: Preprocessing (remains the same)
-        logger.info("Steps 1-3: Correcting perspective, deskewing, and removing lines...")
+        # Step 1: Perspective Correction
+        logger.info("Step 1: Correcting perspective...")
         corrected_img = correct_perspective(pil_img)
-        deskewed_img = deskew_image(corrected_img)
+
+        # Step 2: Deskewing
+        logger.info("Step 2: Deskewing image (Skipped)...")
+        deskewed_img = corrected_img # Pass corrected_img directly
+        
+        # Step 3: Preprocessing (Line removal)
+        logger.info("Step 3: Removing horizontal lines...")
         processed_img_for_detection = remove_horizontal_lines(deskewed_img)
         
         # Step 4: Run detection using the FULL ocr_predictor to get structured output
@@ -119,7 +125,7 @@ def ocr_pipeline(pil_img):
 
         if not result.pages or not result.pages[0].blocks:
             logger.warning("No text blocks detected by DocTR.")
-            return "No text blocks detected.", corrected_img, deskewed_img, processed_img_for_detection, deskewed_img.copy().convert("RGB")
+            return "No text blocks detected.", corrected_img, deskewed_img, processed_img_for_detection, pil_img.copy().convert("RGB")
 
         # The pipeline is now simplified. We directly use the results from the ocr_predictor.
         # No more manual box merging or second-pass recognition. This is the "plug-and-play" approach.
@@ -156,6 +162,7 @@ def ocr_pipeline(pil_img):
         
         logger.info("OCR pipeline completed successfully.")
         
+        # For display purposes, we'll show the simplified input in the other slots
         return out_text, corrected_img, deskewed_img, processed_img_for_detection, vis_img
         
     except Exception as e:
@@ -174,8 +181,8 @@ demo = gr.Interface(
         gr.Image(type="pil", label="3. Preprocessed (Lines Removed)"),
         gr.Image(type="pil", label="4. Final Result (Boxes on Deskewed Image)")
     ],
-    title="English OCR Pipeline (REFACTORED for Handwriting)",
-    description="Shows the output of each step. NEW: 1. Detect Only -> 2. Merge Boxes -> 3. Recognize Line-by-Line. This should improve handwriting recognition."
+    title="English OCR Pipeline",
+    description="Full OCR pipeline including perspective correction, deskewing, and line removal for improved accuracy on mobile captures."
 )
 
 if __name__ == "__main__":

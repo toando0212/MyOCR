@@ -47,4 +47,6 @@ dependencies {
     testImplementation libs.junit
     androidTestImplementation libs.ext.junit
     androidTestImplementation libs.espresso.core
+    implementation 'com.microsoft.onnxruntime:onnxruntime-android:1.17.3'
+    implementation project(':sdk')
 }

@@ -67,7 +67,7 @@
     <string name="failed_to_parse_ocr_result">Failed to parse OCR result</string>
     <string name="failed_to_process_image">Failed to process image: %1$s</string>
     <string name="cannot_open_image">Cannot open image</string>
-    <string name="edit_image">Chỉnh sửa ảnh</string>
+    <string name="edit_image">Edit</string>
     <string name="processing">Processing...</string>
     <string name="login">Login</string>
     <string name="continue_as_guest">Continue as Guest</string>
@@ -98,4 +98,5 @@
     <string name="stop_ocr_confirmation">Are you sure you want to stop the OCR process?</string>
     <string name="ocr_stopped_message">OCR process stopped.</string>
     <string name="long_press_to_delete">Long-press on an image to delete</string>
+    <string name="confirm">Confirm</string>
 </resources>

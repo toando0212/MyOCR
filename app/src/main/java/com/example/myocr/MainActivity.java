@@ -7,6 +7,7 @@ import android.content.pm.PackageManager;
 import android.content.res.Configuration;
 import android.database.Cursor;
 import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -67,6 +68,17 @@ import org.apache.poi.xwpf.usermodel.XWPFDocument;
 import org.apache.poi.xwpf.usermodel.XWPFParagraph;
 import org.apache.poi.xwpf.usermodel.XWPFRun;
 
+import org.opencv.android.OpenCVLoader;
+
+import ai.onnxruntime.OnnxTensor;
+import ai.onnxruntime.OrtEnvironment;
+import ai.onnxruntime.OrtSession;
+import android.graphics.Matrix;
+import java.nio.ByteBuffer;
+import java.nio.FloatBuffer;
+import android.content.res.AssetFileDescriptor;
+import java.util.Optional;
+
 public class MainActivity extends AppCompatActivity implements ImageAdapter.OnImageClickListener, HistoryAdapter.OnHistorySessionInteractionListener {
     private static final int REQUEST_CAMERA_PERMISSION = 100;
     private static final int REQUEST_WRITE_STORAGE_PERMISSION = 102; // For export
@@ -88,6 +100,14 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
     private int currentOcrIndex = -1;
     private volatile boolean stopOcrRequested = false;
     private Call currentOcrCall;
+
+    private OrtEnvironment ortEnv;
+    private OrtSession ortSession;
+    private OrtSession detectionSession;
+    private OrtSession englishRecognitionSession;
+
+    private Vocab vietnameseVocab;
+    private Vocab englishVocab;
 
     private ActivityResultLauncher<Intent> pickImageLauncher;
     private ActivityResultLauncher<Intent> captureImageLauncher;
@@ -112,8 +132,45 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
             .build();
     private static final String BASE_URL = "https://7c2c-2405-4803-f801-12a0-1883-6ffe-89a4-5660.ngrok-free.app"; // IMPORTANT: Use your actual server URL
 
+    static {
+        if(OpenCVLoader.initDebug()){
+            Log.d("MainActivity", "OpenCV is loaded");
+        } else {
+            Log.e("MainActivity", "OpenCV is not loaded");
+        }
+    }
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        // Initialize ONNX Runtime
+        try {
+            ortEnv = OrtEnvironment.getEnvironment();
+
+            byte[] vietocrModelData = readBytesFromAsset("vietocr_vgg_seq2seq_opset14.onnx");
+            ortSession = ortEnv.createSession(vietocrModelData);
+
+            byte[] detectionModelData = readBytesFromAsset("fast_small_detection.onnx");
+            detectionSession = ortEnv.createSession(detectionModelData);
+
+            byte[] englishRecognitionModelData = readBytesFromAsset("vitstr_small_recognition.onnx");
+            englishRecognitionSession = ortEnv.createSession(englishRecognitionModelData);
+
+            Log.d("MainActivity", "All ONNX models loaded successfully.");
+
+            // Initialize Vocabularies
+            // Vietnamese vocabulary from base.yml
+            String vietnameseChars = "aAàÀảẢãÃáÁạẠăĂằẰẳẲẵẴắẮặẶâÂầẦẩẨẫẪấẤậẬbBcCdDđĐeEèÈẻẺẽẼéÉẹẸêÊềỀểỂễỄếẾệỆfFgGhHiIìÌỉỈĩĨíÍịỊjJkKlLmMnNoOòÒỏỎõÕóÓọỌôÔồỒổỔỗỖốỐộỘơƠờỜởỞỡỠớỚợƠpPqQrRsStTuUùÙủỦũŨúÚụỤưƯừỪửỬữỮứỨựỨvVwWxXyYỳỲỷỶỹỸýÝỵỴzZ0123456789!\\\"#$%&\'()*+,-./:;<=>?@[\\\\]^_`{|}~ ";
+            vietnameseVocab = new Vocab(vietnameseChars);
+
+            // English vocabulary (common characters, you might need to adjust this based on vitstr_small_recognition's actual vocab)
+            String englishChars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!\\\"#$%&\'()*+,-./:;<=>?@[\\\\]^_`{|}~ ";
+            englishVocab = new Vocab(englishChars);
+
+        } catch (Exception e) {
+            Log.e("MainActivity", "Error loading ONNX models or vocab: " + e.getMessage());
+            Toast.makeText(this, "Error loading ONNX models or vocab: " + e.getMessage(), Toast.LENGTH_LONG).show();
+        }
+
         // Đọc ngôn ngữ đã lưu (nếu có)
         String lang = getSharedPreferences("settings", MODE_PRIVATE).getString("lang", "en");
         setLocale(lang);
@@ -164,11 +221,15 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
                                     imageUris.add(imageUri);
                                 }
                             }
+                            imageAdapter.setImageUris(imageUris); // Update for multi-select
                         } else if (data.getData() != null) {
                             Uri imageUri = data.getData();
-                            imageUris.add(imageUri);
+                            // Immediately launch ImageViewerActivity for a new image
+                            Intent intent = new Intent(MainActivity.this, ImageViewerActivity.class);
+                            intent.setData(imageUri);
+                            intent.putExtra("image_position", -1); // -1 indicates a new image
+                            imageViewerLauncher.launch(intent);
                         }
-                        imageAdapter.setImageUris(imageUris);
                     }
                 }
         );
@@ -190,14 +251,17 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
                 result -> {
                     if (result.getResultCode() == RESULT_OK && result.getData() != null) {
                         Uri editedImageUri = result.getData().getData();
+                        int position = result.getData().getIntExtra("image_position", -1);
+
                         if (editedImageUri != null) {
-                            // Find the position of the original image and replace it with the edited one
-                            // For simplicity, let's assume we replace the last edited image.
-                            // A more robust solution might involve passing the original image's position.
-                            if (!imageUris.isEmpty()) {
-                                imageUris.set(imageUris.size() - 1, editedImageUri);
-                                imageAdapter.setImageUris(imageUris);
+                            if (position > -1 && position < imageUris.size()) {
+                                // Replace existing image
+                                imageUris.set(position, editedImageUri);
+                            } else {
+                                // Add new image
+                                imageUris.add(editedImageUri);
                             }
+                            imageAdapter.setImageUris(imageUris);
                         }
                     }
                 }
@@ -499,88 +563,141 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
         }
     }
 
+    private FloatBuffer preprocessImageForRecognition(Bitmap bitmap) {
+        // Resize bitmap to 32x128 (Height x Width) as required by the model
+        Bitmap resizedBitmap = Bitmap.createScaledBitmap(bitmap, 128, 32, true);
+
+        int width = resizedBitmap.getWidth();
+        int height = resizedBitmap.getHeight();
+        FloatBuffer floatBuffer = FloatBuffer.allocate(width * height * 3); // RGB channels
+        int[] intValues = new int[width * height];
+        resizedBitmap.getPixels(intValues, 0, width, 0, 0, width, height);
+
+        for (int i = 0; i < intValues.length; ++i) {
+            final int val = intValues[i];
+            // Normalize to -1 to 1 range and handle channels
+            floatBuffer.put((((float) ((val >> 16) & 0xFF)) / 255.0f - 0.5f) / 0.5f); // Red
+            floatBuffer.put((((float) ((val >> 8) & 0xFF)) / 255.0f - 0.5f) / 0.5f);  // Green
+            floatBuffer.put((((float) (val & 0xFF)) / 255.0f - 0.5f) / 0.5f);         // Blue
+        }
+        floatBuffer.rewind();
+        return floatBuffer;
+    }
+
+    private FloatBuffer preprocessImageForDetection(Bitmap bitmap) {
+        // Resize bitmap to a common detection model input size, e.g., 640x640
+        Bitmap resizedBitmap = Bitmap.createScaledBitmap(bitmap, 640, 640, true);
+
+        int width = resizedBitmap.getWidth();
+        int height = resizedBitmap.getHeight();
+        FloatBuffer floatBuffer = FloatBuffer.allocate(width * height * 3); // RGB channels
+        int[] intValues = new int[width * height];
+        resizedBitmap.getPixels(intValues, 0, width, 0, 0, width, height);
+
+        // Normalize pixel values to 0-1 range
+        for (int i = 0; i < intValues.length; ++i) {
+            final int val = intValues[i];
+            floatBuffer.put(((float) ((val >> 16) & 0xFF)) / 255.0f); // Red
+            floatBuffer.put(((float) ((val >> 8) & 0xFF)) / 255.0f);  // Green
+            floatBuffer.put(((float) (val & 0xFF)) / 255.0f);         // Blue
+        }
+        floatBuffer.rewind();
+        return floatBuffer;
+    }
+
     private void performOcrForImage(Uri imageUri, final int position, int userId) {
-        byte[] imageData;
-        try (InputStream iStream = getContentResolver().openInputStream(imageUri)) {
-            if (iStream == null) throw new IOException("Unable to open InputStream.");
-            imageData = getBytes(iStream);
-        } catch (IOException e) {
-            e.printStackTrace();
-            runOnUiThread(() -> updateOcrResult(position, getString(R.string.failed_to_process_image, e.getMessage()), false));
+        // Add null checks for ONNX Runtime sessions
+        if (ortSession == null || detectionSession == null || englishRecognitionSession == null) {
+            runOnUiThread(() -> updateOcrResult(position, getString(R.string.failed_to_process_image, "ONNX Runtime sessions not initialized. Please restart the app."), false));
             triggerNextImageProcessing();
             return;
         }
 
-        // Dynamically determine the MIME type from the content URI to avoid format errors.
-        String mimeType = getContentResolver().getType(imageUri);
-        if (mimeType == null) {
-            // Fallback for safety, though it should ideally not be null for gallery/camera images
-            mimeType = "image/jpeg";
-            Log.w("OCR_MIME_TYPE", "MIME type was null for URI: " + imageUri + ". Defaulting to image/jpeg.");
+        try (InputStream iStream = getContentResolver().openInputStream(imageUri)) {
+            if (iStream == null) throw new IOException("Unable to open InputStream.");
+            Bitmap originalBitmap = BitmapFactory.decodeStream(iStream);
+
+            if (originalBitmap == null) {
+                runOnUiThread(() -> updateOcrResult(position, getString(R.string.failed_to_process_image, "Could not decode image."), false));
+                triggerNextImageProcessing();
+                return;
+            }
+
+            // --- TEXT DETECTION STEP ---
+            FloatBuffer detectionInputBuffer = preprocessImageForDetection(originalBitmap);
+            long[] detectionInputShape = {1, 3, 640, 640}; // Batch size 1, 3 channels, 640 height, 640 width
+            java.util.Map<String, OnnxTensor> detectionInputs = new java.util.HashMap<>();
+            detectionInputs.put(new ArrayList<>(detectionSession.getInputNames()).get(0), OnnxTensor.createTensor(ortEnv, detectionInputBuffer, detectionInputShape));
+
+            // Run detection model
+            OrtSession.Result detectionResult = detectionSession.run(detectionInputs);
+
+            // Process detection output
+            OnnxTensor detectionOutput = (OnnxTensor) detectionResult.get(new ArrayList<>(detectionSession.getOutputNames()).get(0)).get();
+            FloatBuffer detectionOutputBuffer = detectionOutput.getFloatBuffer();
+            // TODO: Parse detectionResult to get bounding boxes of text
+            // For now, we will assume one full image detection for simplicity.
+            // This part will be expanded in the next steps.
+            detectionResult.close(); // Close detection result
+
+            // --- RECOGNITION STEP (using the whole image as a single text line for now) ---
+            // This part will be iterated over detected bounding boxes in the next steps.
+            FloatBuffer recognitionInputData = preprocessImageForRecognition(originalBitmap);
+
+            long[] recognitionInputShape = {1, 3, 32, 128}; // Batch size 1, 3 channels, 32 height, 128 width
+            java.util.Map<String, OnnxTensor> recognitionInputs = new java.util.HashMap<>();
+            recognitionInputs.put(new ArrayList<>(ortSession.getInputNames()).get(0), OnnxTensor.createTensor(ortEnv, recognitionInputData, recognitionInputShape));
+
+            // Determine which recognition model to use based on language selection
+            OrtSession currentRecognitionSession;
+            Vocab currentVocab;
+            if (radioVietnamese.isChecked()) {
+                currentRecognitionSession = ortSession;
+                currentVocab = vietnameseVocab;
+            } else {
+                currentRecognitionSession = englishRecognitionSession;
+                currentVocab = englishVocab;
+            }
+
+            // Run recognition model
+            OrtSession.Result recognitionResult = currentRecognitionSession.run(recognitionInputs);
+            OnnxTensor recognitionOutput = (OnnxTensor) recognitionResult.get(new ArrayList<>(currentRecognitionSession.getOutputNames()).get(0)).get();
+            long[] outputShape = (long[]) recognitionOutput.getInfo().getShape(); // Shape is [batch_size, seq_len, vocab_size]
+            float[] outputData = recognitionOutput.getFloatBuffer().array();
+
+            // Decode the logits to text
+            int seqLen = (int) outputShape[1];
+            int vocabSize = (int) outputShape[2];
+            int[] predictedCharIds = new int[seqLen];
+
+            for (int i = 0; i < seqLen; i++) {
+                int bestCharIndex = -1;
+                float maxLogit = Float.MIN_VALUE;
+                for (int j = 0; j < vocabSize; j++) {
+                    float currentLogit = outputData[i * vocabSize + j];
+                    if (currentLogit > maxLogit) {
+                        maxLogit = currentLogit;
+                        bestCharIndex = j;
+                    }
+                }
+                predictedCharIds[i] = bestCharIndex;
+            }
+
+            String recognizedText = currentVocab.decode(predictedCharIds);
+
+            runOnUiThread(() -> updateOcrResult(position, recognizedText, false));
+            recognitionResult.close(); // Close the recognition result to free resources
+
+        } catch (Exception e) {
+            Log.e("MainActivity", "Error during ONNX inference: " + e.getMessage());
+            runOnUiThread(() -> updateOcrResult(position, getString(R.string.failed_to_process_image, e.getMessage()), false));
+        } finally {
+            // Make sure to close current OCR call if it was an HTTP one (before modification)
+            if (currentOcrCall != null && !currentOcrCall.isCanceled()) {
+                currentOcrCall.cancel();
+            }
+            triggerNextImageProcessing();
         }
-        MediaType mediaType = MediaType.parse(mimeType);
-
-        RequestBody requestBody = new MultipartBody.Builder()
-                .setType(MultipartBody.FORM)
-                .addFormDataPart("image", "image.jpg", RequestBody.create(imageData, mediaType))
-                .addFormDataPart("language", radioVietnamese.isChecked() ? "vie" : "eng")
-                .addFormDataPart("user_id", String.valueOf(userId))
-                .build();
-
-        Request request = new Request.Builder()
-                .url(BASE_URL + "/classify")
-                .post(requestBody)
-                .build();
-
-        currentOcrCall = client.newCall(request);
-        currentOcrCall.enqueue(new Callback() {
-            @Override
-            public void onFailure(@NonNull Call call, @NonNull IOException e) {
-                if (call.isCanceled()) {
-                    Log.d("OCR_STOP", "Call was canceled by user.");
-                    // UI is reset by the stop button listener, no need to trigger next
-                } else {
-                    runOnUiThread(() -> {
-                        updateOcrResult(position, "Network Error", false);
-                        Toast.makeText(MainActivity.this, getString(R.string.ocr_request_failed, e.getMessage()), Toast.LENGTH_SHORT).show();
-                    });
-                    triggerNextImageProcessing(); // Try next image on failure
-                }
-            }
-
-            @Override
-            public void onResponse(@NonNull Call call, @NonNull Response response) throws IOException {
-                try (ResponseBody responseBody = response.body()) {
-                    if (!response.isSuccessful()) {
-                        final String errorBody = responseBody != null ? responseBody.string() : "Unknown error";
-                        runOnUiThread(() -> {
-                            updateOcrResult(position, "Error: " + response.code(), false);
-                            Toast.makeText(MainActivity.this, "OCR failed: " + errorBody, Toast.LENGTH_SHORT).show();
-                        });
-                        return; // Do not trigger next if there's a server error for this image
-                    }
-
-                    final String responseData = responseBody != null ? responseBody.string() : "";
-                    try {
-                        JSONObject jsonObject = new JSONObject(responseData);
-                        JSONArray results = jsonObject.getJSONArray("results");
-                        if (results.length() > 0) {
-                            String recognizedText = results.getJSONObject(0).getString("text");
-                            runOnUiThread(() -> updateOcrResult(position, recognizedText, false));
-                        } else {
-                            runOnUiThread(() -> updateOcrResult(position, getString(R.string.no_text_recognized), false));
-                        }
-                    } catch (JSONException e) {
-                        runOnUiThread(() -> {
-                            updateOcrResult(position, "Parse Error", false);
-                            Toast.makeText(MainActivity.this, R.string.failed_to_parse_ocr_result, Toast.LENGTH_SHORT).show();
-                        });
-                    }
-                } finally {
-                    triggerNextImageProcessing();
-                }
-            }
-        });
     }
 
     private void updateOcrResult(int position, String text, boolean isProcessing) {
@@ -716,18 +833,12 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
 
     @Override
     public void onImageClick(Uri imageUri) {
-        // This is for the top image list, not history
-        // OLD: show delete confirmation dialog
-        // NEW: Open image in a viewer
-        Intent intent = new Intent(Intent.ACTION_VIEW);
-        intent.setDataAndType(imageUri, "image/*");
-        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION); // Important for content URIs
-        try {
-            startActivity(intent);
-        } catch (Exception e) {
-            Toast.makeText(this, "No application can handle this request. Please install a gallery app.", Toast.LENGTH_SHORT).show();
-            e.printStackTrace();
-        }
+        // When an image in the recycler view is clicked, open it in the viewer for editing
+        int position = imageUris.indexOf(imageUri);
+        Intent intent = new Intent(this, ImageViewerActivity.class);
+        intent.setData(imageUri);
+        intent.putExtra("image_position", position);
+        imageViewerLauncher.launch(intent);
     }
 
     @Override
@@ -882,5 +993,40 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
                 })
                 .setNegativeButton(R.string.cancel, null)
                 .show();
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        try {
+            if (ortSession != null) {
+                ortSession.close();
+            }
+            if (detectionSession != null) {
+                detectionSession.close();
+            }
+            if (englishRecognitionSession != null) {
+                englishRecognitionSession.close();
+            }
+            if (ortEnv != null) {
+                ortEnv.close();
+            }
+        } catch (Exception e) {
+            Log.e("MainActivity", "Error closing ONNX Runtime sessions: " + e.getMessage());
+        }
+    }
+
+    private byte[] readBytesFromAsset(String assetFileName) throws IOException {
+        InputStream is = getAssets().open(assetFileName);
+        ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+        int nRead;
+        byte[] data = new byte[16384]; // 16KB buffer
+
+        while ((nRead = is.read(data, 0, data.length)) != -1) {
+            buffer.write(data, 0, nRead);
+        }
+        buffer.flush();
+        is.close();
+        return buffer.toByteArray();
     }
 }
