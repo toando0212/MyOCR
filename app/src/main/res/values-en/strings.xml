@@ -47,4 +47,5 @@
     <string name="no">No</string>
     <string name="ocr_stopped_message">OCR process stopped by user.</string>
     <string name="long_press_to_delete">Long-press on an image to delete</string>
+    <string name="toast_corner_suggestion">For best results, please ensure the photo captures all four corners of the document.</string>
 </resources> 

@@ -66,6 +66,7 @@ public class ImageViewerActivity extends AppCompatActivity implements ThumbnailA
     private PointF[][] savedCorners;
     private List<Bitmap> previewBitmaps = new ArrayList<>();
     private List<Bitmap> thumbnailBitmaps = new ArrayList<>();
+    private ArrayList<Bitmap> processedBitmaps;
 
     private int currentPosition = 0;
 
@@ -93,6 +94,21 @@ public class ImageViewerActivity extends AppCompatActivity implements ThumbnailA
         setupRecyclerView();
         setupClickListeners();
         loadImages(sourceUris);
+
+        Toast.makeText(this, "Để có kết quả tốt nhất, vui lòng đảm bảo ảnh chụp có đủ 4 góc của tài liệu.", Toast.LENGTH_LONG).show();
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        if (currentOriginalBitmap != null && !currentOriginalBitmap.isRecycled()) {
+            currentOriginalBitmap.recycle();
+        }
+        for (Bitmap bmp : previewBitmaps) { if (bmp != null && !bmp.isRecycled()) bmp.recycle(); }
+        for (Bitmap bmp : thumbnailBitmaps) { if (bmp != null && !bmp.isRecycled()) bmp.recycle(); }
+        if (processedBitmaps != null) {
+            for (Bitmap bmp : processedBitmaps) { if (bmp != null && !bmp.isRecycled()) bmp.recycle(); }
+        }
     }
 
     private void initViews() {
@@ -133,6 +149,7 @@ public class ImageViewerActivity extends AppCompatActivity implements ThumbnailA
             previewBitmaps.clear();
             thumbnailBitmaps.clear();
             savedCorners = new PointF[uris.size()][];
+            processedBitmaps = new ArrayList<>(Collections.nCopies(uris.size(), null));
 
             // Only load lightweight previews and thumbnails
             for (Uri uri : uris) {
@@ -170,10 +187,21 @@ public class ImageViewerActivity extends AppCompatActivity implements ThumbnailA
         currentPosition = position;
         thumbnailAdapter.setSelectedPosition(position);
         
-        // 1. Immediately display the cached preview and reset UI
-        fullScreenImageView.setImageBitmap(previewBitmaps.get(position));
-        resetToPreviewState();
-        polygonView.setDefaultCorners(fullScreenImageView.getWidth(), fullScreenImageView.getHeight());
+        // BUG FIX: Check for cached processed image first
+        Bitmap cachedProcessed = processedBitmaps.get(position);
+        if (cachedProcessed != null && !cachedProcessed.isRecycled()) {
+            fullScreenImageView.setImageBitmap(cachedProcessed);
+            enterCroppedState();
+        } else {
+            // 1. Immediately display the cached preview and reset UI
+            fullScreenImageView.setImageBitmap(previewBitmaps.get(position));
+            // Only reset UI, not data
+            currentState = State.VIEWING;
+            polygonView.setVisibility(View.VISIBLE);
+            btnConfirm.setText(R.string.confirm);
+            btnEdit.setText(R.string.edit_image);
+            polygonView.setDefaultCorners(fullScreenImageView.getWidth(), fullScreenImageView.getHeight());
+        }
 
         // 2. Load the full bitmap and find corners in the background
         progressBar.setVisibility(View.VISIBLE);
@@ -242,6 +270,12 @@ public class ImageViewerActivity extends AppCompatActivity implements ThumbnailA
         
         if (croppedColor != null) {
             Bitmap finalProcessed = createFinalProcessedBitmap(croppedColor);
+            
+            // BUG FIX: Cache the processed bitmap
+            Bitmap oldCached = processedBitmaps.get(currentPosition);
+            if(oldCached != null) oldCached.recycle();
+            processedBitmaps.set(currentPosition, finalProcessed.copy(finalProcessed.getConfig(), true)); // Store a copy
+
             fullScreenImageView.setImageBitmap(finalProcessed);
             croppedColor.recycle(); // We don't need the intermediate color crop anymore
         }
@@ -261,21 +295,28 @@ public class ImageViewerActivity extends AppCompatActivity implements ThumbnailA
                 Bitmap finalBitmapToSave = null;
                 Uri uri = null;
                 try {
-                    bitmapToProcess = getCorrectlyOrientedBitmap(sourceUris.get(i));
-                    
-                    if (savedCorners[i] != null) {
-                        Bitmap croppedBitmap = performPerspectiveTransform(bitmapToProcess, savedCorners[i]);
-                        finalBitmapToSave = createFinalProcessedBitmap(croppedBitmap);
-                        croppedBitmap.recycle();
-                    } else {
-                        finalBitmapToSave = createFinalProcessedBitmap(bitmapToProcess);
-                    }
-                    
-                    if (finalBitmapToSave != null) {
+                    // BUG FIX: Check cache first before processing
+                    finalBitmapToSave = processedBitmaps.get(i);
+                    if (finalBitmapToSave != null && !finalBitmapToSave.isRecycled()) {
+                        // Already processed, just save it
                         uri = saveBitmapToFile(finalBitmapToSave);
-                        finalBitmapToSave.recycle();
+                    } else {
+                        // Not processed yet, process it now
+                        bitmapToProcess = getCorrectlyOrientedBitmap(sourceUris.get(i));
+                        if (savedCorners[i] != null) {
+                            Bitmap croppedBitmap = performPerspectiveTransform(bitmapToProcess, savedCorners[i]);
+                            finalBitmapToSave = createFinalProcessedBitmap(croppedBitmap);
+                            croppedBitmap.recycle();
+                        } else {
+                            finalBitmapToSave = createFinalProcessedBitmap(bitmapToProcess);
+                        }
+
+                        if (finalBitmapToSave != null) {
+                            uri = saveBitmapToFile(finalBitmapToSave);
+                            finalBitmapToSave.recycle(); // It's a temporary bitmap
+                        }
                     }
-                    
+
                     if (uri != null) {
                         finalUris.add(uri);
                     }
@@ -312,6 +353,16 @@ public class ImageViewerActivity extends AppCompatActivity implements ThumbnailA
             fullScreenImageView.setImageBitmap(previewBitmaps.get(currentPosition));
         }
         polygonView.setVisibility(View.VISIBLE);
+
+        // BUG FIX: Clear the cached processed bitmap when resetting
+        if (processedBitmaps != null && currentPosition < processedBitmaps.size()) {
+            Bitmap cached = processedBitmaps.get(currentPosition);
+            if (cached != null) {
+                cached.recycle();
+            }
+            processedBitmaps.set(currentPosition, null);
+        }
+
         // We now need to re-fetch corners if user resets
         if(savedCorners != null && currentPosition < savedCorners.length) {
             // When resetting, we clear the saved state for this image
@@ -420,6 +471,11 @@ public class ImageViewerActivity extends AppCompatActivity implements ThumbnailA
     }
 
     private Bitmap createPreviewBitmap(Bitmap bitmap) {
+        // BUG FIX: Add a check to prevent re-processing a binary image.
+        if (isGrayscale(bitmap)) {
+            return bitmap.copy(Bitmap.Config.ARGB_8888, false); // Already processed, just return
+        }
+
         Mat srcMat = new Mat();
         Utils.bitmapToMat(bitmap, srcMat);
         Mat grayMat = new Mat();
@@ -437,18 +493,94 @@ public class ImageViewerActivity extends AppCompatActivity implements ThumbnailA
         return preview;
     }
 
-    private PointF[] findDocumentCorners(Bitmap bitmap) {
-        Mat srcMat = new Mat();
-        Utils.bitmapToMat(bitmap, srcMat);
+    private boolean isGrayscale(Bitmap bitmap) {
+        if (bitmap == null || bitmap.getWidth() < 10 || bitmap.getHeight() < 10) {
+            return false; // Not a valid image to check
+        }
+        // Check a few pixels to see if R, G, and B components are equal.
+        int pixel1 = bitmap.getPixel(5, 5);
+        int r1 = (pixel1 >> 16) & 0xff;
+        int g1 = (pixel1 >> 8) & 0xff;
+        int b1 = pixel1 & 0xff;
+        if (r1 != g1 || r1 != b1) return false;
 
+        int pixel2 = bitmap.getPixel(bitmap.getWidth() - 5, bitmap.getHeight() - 5);
+        int r2 = (pixel2 >> 16) & 0xff;
+        int g2 = (pixel2 >> 8) & 0xff;
+        int b2 = pixel2 & 0xff;
+        if (r2 != g2 || r2 != b2) return false;
+
+        return true;
+    }
+
+    private PointF[] findDocumentCorners(Bitmap bitmap) {
+        // This is a new implementation based on the GrabCut pipeline for robustness.
+        if (bitmap == null || bitmap.isRecycled()) return null;
+
+        // --- BUG FIX: Downscale bitmap for processing to prevent OOM errors and improve speed ---
+        int MAX_PROCESSING_SIZE = 960; // A reasonable size for processing
+        double scale = 1.0;
+        Bitmap processingBitmap;
+
+        if (bitmap.getWidth() > MAX_PROCESSING_SIZE || bitmap.getHeight() > MAX_PROCESSING_SIZE) {
+            if (bitmap.getWidth() > bitmap.getHeight()) {
+                scale = (double) bitmap.getWidth() / MAX_PROCESSING_SIZE;
+            } else {
+                scale = (double) bitmap.getHeight() / MAX_PROCESSING_SIZE;
+            }
+            int newWidth = (int) (bitmap.getWidth() / scale);
+            int newHeight = (int) (bitmap.getHeight() / scale);
+            processingBitmap = Bitmap.createScaledBitmap(bitmap, newWidth, newHeight, true);
+        } else {
+            // Use the original bitmap if it's small enough
+            processingBitmap = bitmap;
+        }
+
+        Mat srcMat = new Mat();
+        Utils.bitmapToMat(processingBitmap, srcMat);
+        // If a scaled copy was made, we can recycle it immediately after converting to Mat
+        if (processingBitmap != bitmap) {
+            processingBitmap.recycle();
+        }
+        Imgproc.cvtColor(srcMat, srcMat, Imgproc.COLOR_RGBA2RGB); // Ensure 3 channels for GrabCut
+
+        // --- 1. GrabCut Background Removal (on the scaled image) ---
+        Mat mask = new Mat();
+        Mat bgdModel = new Mat();
+        Mat fgdModel = new Mat();
+        // Define a rectangle slightly smaller than the image as the initial region of interest
+        org.opencv.core.Rect rect = new org.opencv.core.Rect(10, 10, srcMat.cols() - 20, srcMat.rows() - 20);
+        
+        Imgproc.grabCut(srcMat, mask, rect, bgdModel, fgdModel, 5, Imgproc.GC_INIT_WITH_RECT);
+        
+        // BUG FIX: The previous pixel-by-pixel loop was extremely slow and caused crashes.
+        // This is a vectorized implementation that is thousands of times faster.
+        // It creates a mask where the foreground pixels (GC_FGD, GC_PR_FGD) are 1 and background are 0.
+        Mat foregroundMask = new Mat();
+        Core.compare(mask, new Scalar(Imgproc.GC_PR_FGD), foregroundMask, Core.CMP_EQ);
+        Mat tempMask = new Mat();
+        Core.compare(mask, new Scalar(Imgproc.GC_FGD), tempMask, Core.CMP_EQ);
+        Core.bitwise_or(foregroundMask, tempMask, foregroundMask);
+        tempMask.release();
+
+        // Apply the mask to get the foreground (the document)
+        Mat foreground = new Mat(srcMat.size(), CvType.CV_8UC3, new Scalar(0, 0, 0));
+        srcMat.copyTo(foreground, foregroundMask);
+
+        // Release memory
+        mask.release();
+        foregroundMask.release();
+        bgdModel.release();
+        fgdModel.release();
+
+        // --- 2. Edge and Contour Detection on the Cleaned Image ---
         Mat grayMat = new Mat();
-        Imgproc.cvtColor(srcMat, grayMat, Imgproc.COLOR_RGB2GRAY);
+        Imgproc.cvtColor(foreground, grayMat, Imgproc.COLOR_RGB2GRAY);
+        foreground.release();
 
         Mat blurredMat = new Mat();
         Imgproc.GaussianBlur(grayMat, blurredMat, new Size(5, 5), 0);
 
-        // Automatically determine Canny thresholds based on image's mean intensity.
-        // This is more robust than fixed thresholds for varying lighting conditions.
         MatOfDouble mean = new MatOfDouble();
         MatOfDouble stddev = new MatOfDouble();
         Core.meanStdDev(grayMat, mean, stddev);
@@ -459,11 +591,9 @@ public class ImageViewerActivity extends AppCompatActivity implements ThumbnailA
         mean.release();
         stddev.release();
         
-        // Canny edge detection is generally more robust for finding document edges
         Mat cannyMat = new Mat();
         Imgproc.Canny(blurredMat, cannyMat, lowerThreshold, upperThreshold);
 
-        // Dilate the edges to help close gaps in the detected contours
         Mat dilatedMat = new Mat();
         Mat kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, new Size(5, 5));
         Imgproc.dilate(cannyMat, dilatedMat, kernel);
@@ -472,64 +602,7 @@ public class ImageViewerActivity extends AppCompatActivity implements ThumbnailA
         Mat hierarchy = new Mat();
         Imgproc.findContours(dilatedMat, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE);
 
-        if (contours.isEmpty()) {
-            // Release memory
-            srcMat.release();
-            grayMat.release();
-            blurredMat.release();
-            cannyMat.release();
-            dilatedMat.release();
-            kernel.release();
-            hierarchy.release();
-            return null;
-        }
-
-        Collections.sort(contours, (c1, c2) -> Double.compare(Imgproc.contourArea(c2), Imgproc.contourArea(c1)));
-
-        for (MatOfPoint contour : contours) {
-            MatOfPoint2f contour2f = new MatOfPoint2f(contour.toArray());
-            double peri = Imgproc.arcLength(contour2f, true);
-            MatOfPoint2f approx = new MatOfPoint2f();
-            Imgproc.approxPolyDP(contour2f, approx, 0.02 * peri, true);
-
-            if (approx.rows() == 4) {
-                double contourArea = Imgproc.contourArea(approx);
-                double imgArea = srcMat.rows() * srcMat.cols();
-                
-                if (contourArea / imgArea > 0.1 && contourArea / imgArea < 0.95 && Imgproc.isContourConvex(new MatOfPoint(approx.toArray()))) {
-                    
-                    Mat mask = Mat.zeros(srcMat.size(), CvType.CV_8UC1);
-                    Imgproc.drawContours(mask, Arrays.asList(new MatOfPoint(approx.toArray())), -1, new Scalar(255), -1);
-                    
-                    Scalar meanScalar = Core.mean(srcMat, mask);
-                    double meanBrightness = (meanScalar.val[0] + meanScalar.val[1] + meanScalar.val[2]) / 3.0;
-
-                    mask.release();
-
-                    if (meanBrightness > 110) {
-                        Point[] foundPoints = approx.toArray();
-                        PointF[] result = new PointF[4];
-                        for (int i = 0; i < 4; i++) {
-                            result[i] = new PointF((float)foundPoints[i].x, (float)foundPoints[i].y);
-                        }
-                        approx.release();
-                        contour2f.release();
-                        
-                        // Release all Mats
-                        srcMat.release();
-                        grayMat.release();
-                        blurredMat.release();
-                        cannyMat.release();
-                        dilatedMat.release();
-                        kernel.release();
-                        hierarchy.release();
-                        return result;
-                    }
-                }
-            }
-            approx.release();
-            contour2f.release();
-        }
+        // Cleanup intermediate Mats
         srcMat.release();
         grayMat.release();
         blurredMat.release();
@@ -537,7 +610,39 @@ public class ImageViewerActivity extends AppCompatActivity implements ThumbnailA
         dilatedMat.release();
         kernel.release();
         hierarchy.release();
-        return null;
+
+        if (contours.isEmpty()) {
+            return null;
+        }
+
+        Collections.sort(contours, (c1, c2) -> Double.compare(Imgproc.contourArea(c2), Imgproc.contourArea(c1)));
+
+        // --- 3. Find and Validate the 4 Corners ---
+        for (MatOfPoint contour : contours) {
+            MatOfPoint2f contour2f = new MatOfPoint2f(contour.toArray());
+            double peri = Imgproc.arcLength(contour2f, true);
+            MatOfPoint2f approx = new MatOfPoint2f();
+            Imgproc.approxPolyDP(contour2f, approx, 0.02 * peri, true);
+
+            if (approx.rows() == 4) { // The contour has 4 corners
+                // The check for brightness is removed as it's no longer relevant after GrabCut
+                if (Imgproc.isContourConvex(new MatOfPoint(approx.toArray()))) {
+                    Point[] foundPoints = approx.toArray();
+                    PointF[] result = new PointF[4];
+                    for (int i = 0; i < 4; i++) {
+                        // --- BUG FIX: Scale the points back to the original image's coordinate system ---
+                        result[i] = new PointF((float)(foundPoints[i].x * scale), (float)(foundPoints[i].y * scale));
+                    }
+                    approx.release();
+                    contour2f.release();
+                    return result;
+                }
+            }
+            approx.release();
+            contour2f.release();
+        }
+
+        return null; // No suitable contour found
     }
 
     private PointF[] orderPoints(PointF[] points) {

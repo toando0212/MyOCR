@@ -170,7 +170,13 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
         }
             
         // The vocabulary can be initialized here as it's lightweight.
-        // IMPORTANT: The vocab must NOT contain the blank character, it's implicitly handled as index 0.
+        // --- VERY IMPORTANT ---
+        // The CRNN model file you are using (`crnn_mobilenet_v3_large.onnx`) has an output dimension of 127.
+        // This means it was trained with a vocabulary of exactly 126 characters (+1 blank token).
+        // The vocabulary string below is a standard 95-character English set and DOES NOT MATCH the model.
+        // Using this will lead to incorrect results.
+        // ACTION REQUIRED: You MUST find and replace the string below with the correct 126-character
+        // vocabulary that was used to train your specific .onnx model for it to work correctly.
         String englishChars = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~ ";
         englishVocab = new Vocab(englishChars);
 
@@ -267,7 +273,6 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
                         // This is the result from ImageViewerActivity
                         if (result.getData().hasExtra("processed_uris")) {
                             ArrayList<Uri> processedUris = result.getData().getParcelableArrayListExtra("processed_uris");
-                            imageUris.clear();
                             imageUris.addAll(processedUris);
                             imageAdapter.notifyDataSetChanged();
                             updateDeleteInstructionVisibility();
@@ -422,8 +427,8 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
              new Thread(() -> {
                  try {
                     // Load models and vocab
-                    detectionSession = ortEnv.createSession(assetFilePath("fast_small.onnx"), new OrtSession.SessionOptions());
-                    englishRecognitionSession = ortEnv.createSession(assetFilePath("vitstr_small.onnx"), new OrtSession.SessionOptions());
+                    detectionSession = ortEnv.createSession(assetFilePath("db_mobilenet_v3_large.onnx"), new OrtSession.SessionOptions());
+                    englishRecognitionSession = ortEnv.createSession(assetFilePath("crnn_mobilenet_v3_large.onnx"), new OrtSession.SessionOptions());
                     
                     // Load Vietnamese vocab - DISABLED for now
                     // try (InputStream is = getAssets().open("vi_vocab.txt")) {
@@ -486,15 +491,22 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
                 Bitmap originalBitmap = BitmapFactory.decodeStream(getContentResolver().openInputStream(imageUri));
                 Mat originalMat = new Mat();
                 Utils.bitmapToMat(originalBitmap, originalMat);
+                
+                // --- NEW FEATURE: Pre-processing step to remove horizontal lines ---
+                removeHorizontalLines(originalMat);
+                // The rest of the pipeline will use the cleaned image.
+                Bitmap cleanedBitmap = Bitmap.createBitmap(originalMat.cols(), originalMat.rows(), Bitmap.Config.ARGB_8888);
+                Utils.matToBitmap(originalMat, cleanedBitmap);
+
                 // Important: work with RGB, not BGR
                 Imgproc.cvtColor(originalMat, originalMat, Imgproc.COLOR_RGBA2RGB);
 
                 // 2. Run Detection to get ROTATED bounding boxes
-                List<RotatedRect> boxes = runDetection(originalBitmap);
+                List<RotatedRect> boxes = runDetection(cleanedBitmap);
                 Log.d("OcrDebugging", "Found " + boxes.size() + " boxes in detection phase.");
 
                 // --- START: Draw Bounding Boxes for Preview ---
-                Bitmap previewBitmap = originalBitmap.copy(Bitmap.Config.ARGB_8888, true);
+                Bitmap previewBitmap = cleanedBitmap.copy(Bitmap.Config.ARGB_8888, true);
                 Mat previewMat = new Mat();
                 Utils.bitmapToMat(previewBitmap, previewMat);
 
@@ -537,7 +549,7 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
                 // We will draw the boxes and also perform recognition in this loop
                 // The original image Mat is needed for cropping
                 Mat originalMatForCropping = new Mat();
-                Utils.bitmapToMat(originalBitmap, originalMatForCropping);
+                Utils.bitmapToMat(cleanedBitmap, originalMatForCropping);
 
                 List<String> recognizedTexts = new ArrayList<>();
                 for (RotatedRect box : boxes) {
@@ -610,6 +622,37 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
         }).start();
     }
 
+    private void removeHorizontalLines(Mat image) {
+        // This function operates in-place on a color Mat (e.g., RGBA)
+        if (image.empty()) return;
+
+        // Work on a copy to avoid modifying the array used in loops
+        Mat gray = new Mat();
+        Imgproc.cvtColor(image, gray, Imgproc.COLOR_RGBA2GRAY);
+
+        Mat binary = new Mat();
+        // Invert the image: Text becomes white, background black. Lines will also be white.
+        Imgproc.adaptiveThreshold(gray, binary, 255, Imgproc.ADAPTIVE_THRESH_MEAN_C, Imgproc.THRESH_BINARY_INV, 15, -2);
+
+        // Detect horizontal lines
+        // The kernel width (e.g., 40) should be adjusted based on the expected line length.
+        Mat horizontalKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, new Size(40, 1));
+        Mat horizontalLines = new Mat();
+        Imgproc.morphologyEx(binary, horizontalLines, Imgproc.MORPH_OPEN, horizontalKernel);
+
+        // Dilate the detected lines slightly to ensure they are fully covered during removal
+        Imgproc.dilate(horizontalLines, horizontalLines, Imgproc.getStructuringElement(Imgproc.MORPH_RECT, new Size(1, 2)));
+
+        // Set the areas of the original image where lines were detected to white
+        image.setTo(new Scalar(255, 255, 255, 255), horizontalLines);
+
+        // Release intermediate Mats
+        gray.release();
+        binary.release();
+        horizontalKernel.release();
+        horizontalLines.release();
+    }
+
     private List<RotatedRect> runDetection(Bitmap bitmap) throws Exception {
         int targetSize = 512;
         // The ratio of the original image
@@ -649,8 +692,8 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
     }
 
     private List<RotatedRect> decodeDetectionOutput(float[][][][] logits, int originalWidth, int originalHeight, float boxThreshold, int resizedWidth, int resizedHeight, int padLeft, int padTop) {
-        // Correct post-processing based on original doctr source code
-        // The single output are logits, not a probability map.
+        // This function now implements post-processing for a DBNet-like model.
+        // The model output is a probability map (logits).
         // Shape is (1, 1, H, W)
         float[][] logitsMap = logits[0][0];
         int height = logitsMap.length;
@@ -663,34 +706,27 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
                 logitsMat.put(y, x, logitsMap[y][x]);
             }
         }
-
-        // --- 2. Dilation (MaxPool2d in PyTorch) applied on raw LOGITS ---
-        // This is the equivalent of `self.pooling(logits)`
-        Mat dilatedLogitsMat = new Mat();
-        // Kernel size 2, stride 1 as a common approximation for FAST's pooling layer.
-        Mat kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, new Size(2, 2));
-        Imgproc.dilate(logitsMat, dilatedLogitsMat, kernel);
-
-        // --- 3. Sigmoid activation to get the probability map ---
-        // This is the equivalent of `torch.sigmoid(...)`
+        
+        // --- 2. Apply Sigmoid to get Probability Map ---
+        // This converts the raw model output (logits) into probabilities [0, 1]
         Mat probMapMat = new Mat(height, width, CvType.CV_32F);
         for (int y = 0; y < height; y++) {
             for (int x = 0; x < width; x++) {
-                float logit = (float) dilatedLogitsMat.get(y, x)[0];
+                float logit = (float) logitsMat.get(y, x)[0];
                 probMapMat.put(y, x, (float) (1.0 / (1.0 + Math.exp(-logit))));
             }
         }
         logitsMat.release(); // free memory
-        dilatedLogitsMat.release();
 
-        // --- 4. Binarization ---
-        // Equivalent to `bitmap = prob_map > bin_thresh`
+        // --- 3. Binarization ---
+        // Equivalent to `bitmap = prob_map > bin_thresh` in the python code.
+        // For DBPostProcessor, the default bin_thresh is 0.3.
         Mat binaryMap = new Mat();
-        float binThresh = 0.1f; // Binarization threshold from FASTPostProcessor default
+        float binThresh = 0.3f;
         Imgproc.threshold(probMapMat, binaryMap, binThresh, 255, Imgproc.THRESH_BINARY);
         binaryMap.convertTo(binaryMap, CvType.CV_8U);
 
-        // --- 5. Find Contours ---
+        // --- 4. Find Contours ---
         List<MatOfPoint> contours = new ArrayList<>();
         Mat hierarchy = new Mat();
         Imgproc.findContours(binaryMap, contours, hierarchy, Imgproc.RETR_LIST, Imgproc.CHAIN_APPROX_SIMPLE);
@@ -704,57 +740,48 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
             scale = (double) originalHeight / resizedHeight;
         }
 
-        // --- 6. Filter Contours by Score & Area ---
+        // --- 5. Filter Contours & Unclip ---
         for (MatOfPoint contour : contours) {
             MatOfPoint2f contour2f = new MatOfPoint2f(contour.toArray());
 
-            // --- 6a. Filter by area (simple check) ---
+            // --- 5a. Filter by area (from python code, min_size_box is small) ---
             if (Imgproc.contourArea(contour) < 2) {
                 contour.release();
                 contour2f.release();
                 continue;
             }
 
-            // --- 6b. Calculate confidence score (like `box_score` in python) ---
-            // Create a mask for the contour area, then calculate the mean of the prob_map within that mask.
+            // --- 5b. Calculate confidence score from the probability map ---
             Mat mask = Mat.zeros(height, width, CvType.CV_8U);
             Imgproc.drawContours(mask, Collections.singletonList(contour), -1, new Scalar(255), -1);
             Scalar meanScoreScalar = Core.mean(probMapMat, mask);
             mask.release();
             float score = (float) meanScoreScalar.val[0];
 
-            // --- 6c. Filter by box_thresh ---
+            // --- 5c. Filter by confidence score (box_thresh) ---
             if (score < boxThreshold) {
                 contour.release();
                 contour2f.release();
                 continue;
             }
 
-            // --- 7. Unclip & Get Final Bounding Box ---
-            // This section implements polygon offsetting, a more accurate way to expand the tight
-            // bounding box from the contour, inspired by the Pyclipper logic in the original library.
-            // Instead of scaling the final rectangle, we dilate the polygon contour itself.
-
+            // --- 6. Unclip Polygon (using dilation as an approximation for pyclipper) ---
             double area = Imgproc.contourArea(contour);
             double length = Imgproc.arcLength(contour2f, true);
-            if (length == 0) { // Avoid division by zero for invalid contours
+            if (length == 0) { // Avoid division by zero
                 contour.release();
                 contour2f.release();
                 continue;
             }
 
-            double unclipRatio = 1.5; // A common ratio for this technique, providing more padding.
+            double unclipRatio = 1.5; // From DBPostProcessor defaults
             double distance = (area * unclipRatio) / length;
-
             int offset = (int) Math.round(distance);
-            if (offset == 0) {
-                 // Ensure there is at least a minimal expansion
-                 offset = 1;
-            }
+            offset = Math.max(1, offset); // Ensure at least a minimal expansion
+
             Mat unclipKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, new Size(2 * offset + 1, 2 * offset + 1));
 
             Mat dilatedContourMask = new Mat();
-            // Draw the single contour on a black canvas to dilate it
             Mat tempMask = Mat.zeros(height, width, CvType.CV_8U);
             Imgproc.drawContours(tempMask, Collections.singletonList(contour), 0, new Scalar(255), -1);
             Imgproc.dilate(tempMask, dilatedContourMask, unclipKernel);
@@ -767,21 +794,13 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
 
             RotatedRect box;
             if (!dilatedContours.isEmpty() && dilatedContours.get(0).total() > 0) {
-                // Take the first (and likely only) contour after dilation
                 box = Imgproc.minAreaRect(new MatOfPoint2f(dilatedContours.get(0).toArray()));
-                // Clean up memory
-                for(MatOfPoint c : dilatedContours) { c.release(); }
+                for (MatOfPoint c : dilatedContours) c.release();
             } else {
-                // Fallback to the original contour if dilation produces nothing
-                box = Imgproc.minAreaRect(contour2f);
-                 if (!dilatedContours.isEmpty()) {
-                    for(MatOfPoint c : dilatedContours) { c.release(); }
-                }
+                box = Imgproc.minAreaRect(contour2f); // Fallback
             }
-            
-            // Adjust the EXPANDED box to original image coordinates
-            // 1. Subtract padding to get coordinates relative to the resized image
-            // 2. Scale up to get coordinates relative to the original image
+
+            // --- 7. Scale box to original image coordinates ---
             double centerX = (box.center.x - padLeft) * scale;
             double centerY = (box.center.y - padTop) * scale;
             double w = box.size.width * scale;
@@ -796,7 +815,7 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
             contour.release();
             contour2f.release();
         }
-        probMapMat.release(); // free memory
+        probMapMat.release();
 
         return validBoxes;
     }
@@ -858,14 +877,15 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
     }
 
     private FloatBuffer preprocessImageForRecognition(Bitmap bitmap) {
-        return preprocessImageForRecognition(bitmap, 32, 128);
+        // The mean and std values are for the CRNN model, taken from the doctr source code.
+        return preprocessImage(bitmap, 128, 32, new float[]{0.694f, 0.695f, 0.693f}, new float[]{0.299f, 0.296f, 0.301f});
     }
 
     private FloatBuffer preprocessImageForRecognition(Bitmap bitmap, int targetHeight, int targetWidth) {
         // This function uses a more generic pre-processing that also pads.
         // The mean and std are for models normalized to [-1, 1] or [0, 1]
-        // For ViTSTR, it's typically [0, 1] and then normalized with mean/std 0.5/0.5
-        return preprocessImage(bitmap, targetWidth, targetHeight, new float[]{0.5f}, new float[]{0.5f});
+        // For CRNN, it's normalized with specific mean/std values.
+        return preprocessImage(bitmap, targetWidth, targetHeight, new float[]{0.694f, 0.695f, 0.693f}, new float[]{0.299f, 0.296f, 0.301f});
     }
 
     private FloatBuffer preprocessImageForDetection(Bitmap bitmap, int targetSize, int newWidth, int newHeight, float[] mean, float[] std) {
@@ -899,10 +919,8 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
         Mat subview = canvasMat.submat(roi);
         resizedMat.copyTo(subview);
 
-        // Convert to float and scale to [0, 1]
+        // Convert to float and normalize
         canvasMat.convertTo(canvasMat, CvType.CV_32F, 1.0 / 255.0);
-
-        // Normalize using mean and std
         Core.subtract(canvasMat, new Scalar(mean[0], mean[1], mean[2]), canvasMat);
         Core.divide(canvasMat, new Scalar(std[0], std[1], std[2]), canvasMat);
 
@@ -965,8 +983,15 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
 
         // Convert to float and normalize
         finalMat.convertTo(finalMat, CvType.CV_32F, 1.0 / 255.0);
-        Core.subtract(finalMat, new Scalar(mean[0], mean[0], mean[0]), finalMat); // Assuming single value for mean/std
-        Core.divide(finalMat, new Scalar(std[0], std[0], std[0]), finalMat);
+        // Use per-channel mean and std. OpenCV Scalar is BGR, but our mat is RGB.
+        // Let's assume the input mean/std are in RGB order.
+        if (mean.length == 3 && std.length == 3) {
+            Core.subtract(finalMat, new Scalar(mean[0], mean[1], mean[2]), finalMat);
+            Core.divide(finalMat, new Scalar(std[0], std[1], std[2]), finalMat);
+        } else { // Fallback for single value mean/std
+            Core.subtract(finalMat, new Scalar(mean[0], mean[0], mean[0]), finalMat);
+            Core.divide(finalMat, new Scalar(std[0], std[0], std[0]), finalMat);
+        }
 
 
         // NCHW
@@ -1253,6 +1278,14 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
     
     private void adjustNavDrawerForStatusBar() {
         // This is a common method to adjust navigation drawer padding for transparent status bars.
+        // BUG FIX: Add padding to the top of the navigation view to avoid being obscured by the system status bar.
+        int statusBarHeight = 0;
+        int resourceId = getResources().getIdentifier("status_bar_height", "dimen", "android");
+        if (resourceId > 0) {
+            statusBarHeight = getResources().getDimensionPixelSize(resourceId);
+        }
+        NavigationView navigationView = findViewById(R.id.nav_view);
+        navigationView.setPadding(navigationView.getPaddingLeft(), navigationView.getPaddingTop() + statusBarHeight, navigationView.getPaddingRight(), navigationView.getPaddingBottom());
     }
     
     private void updateDeleteInstructionVisibility() {

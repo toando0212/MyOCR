@@ -51,4 +51,5 @@
     <string name="stop_ocr_confirmation">Bạn có chắc muốn dừng quá trình OCR không?</string>
     <string name="ocr_stopped_message">Quá trình OCR đã bị người dùng dừng lại.</string>
     <string name="long_press_to_delete">Nhấn giữ vào ảnh để xoá</string>
+    <string name="toast_corner_suggestion">Để có kết quả tốt nhất, vui lòng đảm bảo ảnh chụp có đủ 4 góc của tài liệu.</string>
 </resources>
