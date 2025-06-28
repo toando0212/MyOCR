@@ -8,9 +8,9 @@
     "triple": "i686-linux-android",
     "llvmTriple": "i686-none-linux-android"
   },
-  "cxxBuildFolder": "D:\\MyOCR\\sdk\\.cxx\\Debug\\132a2g45\\x86",
-  "soFolder": "D:\\MyOCR\\sdk\\build\\intermediates\\cxx\\Debug\\132a2g45\\obj\\x86",
-  "soRepublishFolder": "D:\\MyOCR\\sdk\\build\\intermediates\\cmake\\debug\\obj\\x86",
+  "cxxBuildFolder": "D:\\MyOCR\\MyOCR\\sdk\\.cxx\\Debug\\132a2g45\\x86",
+  "soFolder": "D:\\MyOCR\\MyOCR\\sdk\\build\\intermediates\\cxx\\Debug\\132a2g45\\obj\\x86",
+  "soRepublishFolder": "D:\\MyOCR\\MyOCR\\sdk\\build\\intermediates\\cmake\\debug\\obj\\x86",
   "abiPlatformVersion": 21,
   "cmake": {
     "effectiveConfiguration": {
@@ -27,10 +27,7 @@
     "variantName": "debug",
     "isDebuggableEnabled": true,
     "validAbiList": [
-      "armeabi-v7a",
-      "arm64-v8a",
-      "x86",
-      "x86_64"
+      "x86"
     ],
     "buildTargetSet": [
       "opencv_jni_shared"
@@ -40,13 +37,13 @@
     ],
     "cmakeSettingsConfiguration": "android-gradle-plugin-predetermined-name",
     "module": {
-      "cxxFolder": "D:\\MyOCR\\sdk\\.cxx",
-      "intermediatesBaseFolder": "D:\\MyOCR\\sdk\\build\\intermediates",
-      "intermediatesFolder": "D:\\MyOCR\\sdk\\build\\intermediates\\cxx",
+      "cxxFolder": "D:\\MyOCR\\MyOCR\\sdk\\.cxx",
+      "intermediatesBaseFolder": "D:\\MyOCR\\MyOCR\\sdk\\build\\intermediates",
+      "intermediatesFolder": "D:\\MyOCR\\MyOCR\\sdk\\build\\intermediates\\cxx",
       "gradleModulePathName": ":sdk",
-      "moduleRootFolder": "D:\\MyOCR\\sdk",
-      "moduleBuildFile": "D:\\MyOCR\\sdk\\build.gradle",
-      "makeFile": "D:\\MyOCR\\sdk\\libcxx_helper\\CMakeLists.txt",
+      "moduleRootFolder": "D:\\MyOCR\\MyOCR\\sdk",
+      "moduleBuildFile": "D:\\MyOCR\\MyOCR\\sdk\\build.gradle",
+      "makeFile": "D:\\MyOCR\\MyOCR\\sdk\\libcxx_helper\\CMakeLists.txt",
       "buildSystem": "CMAKE",
       "ndkFolder": "C:\\Users\\quang\\AppData\\Local\\Android\\Sdk\\ndk\\26.1.10909125",
       "ndkFolderBeforeSymLinking": "C:\\Users\\quang\\AppData\\Local\\Android\\Sdk\\ndk\\26.1.10909125",
@@ -144,9 +141,10 @@
         "SYSTEM": {}
       },
       "project": {
-        "rootBuildGradleFolder": "D:\\MyOCR",
+        "rootBuildGradleFolder": "D:\\MyOCR\\MyOCR",
         "sdkFolder": "C:\\Users\\quang\\AppData\\Local\\Android\\Sdk",
         "isBuildOnlyTargetAbiEnabled": true,
+        "ideBuildTargetAbi": "x86",
         "isCmakeBuildCohabitationEnabled": false,
         "isPrefabEnabled": false
       },
@@ -163,12 +161,12 @@
   "buildSettings": {
     "environmentVariables": []
   },
-  "prefabFolder": "D:\\MyOCR\\sdk\\.cxx\\Debug\\132a2g45\\prefab\\x86",
+  "prefabFolder": "D:\\MyOCR\\MyOCR\\sdk\\.cxx\\Debug\\132a2g45\\prefab\\x86",
   "isActiveAbi": true,
   "fullConfigurationHash": "132a2g4540744246x5l1t695k6h51c4r6c266g3h1p1c4y1u1sfz4r2d5y6f",
   "fullConfigurationHashKey": "# Values used to calculate the hash in this folder name.\n# Should not depend on the absolute path of the project itself.\n#   - AGP: 8.4.1.\n#   - $NDK is the path to NDK 26.1.10909125.\n#   - $PROJECT is the path to the parent folder of the root Gradle build file.\n#   - $ABI is the ABI to be built with. The specific value doesn\u0027t contribute to the value of the hash.\n#   - $HASH is the hash value computed from this text.\n#   - $CMAKE is the path to CMake 3.22.1.\n#   - $NINJA is the path to Ninja.\n-H$PROJECT/sdk/libcxx_helper\n-DCMAKE_SYSTEM_NAME\u003dAndroid\n-DCMAKE_EXPORT_COMPILE_COMMANDS\u003dON\n-DCMAKE_SYSTEM_VERSION\u003d21\n-DANDROID_PLATFORM\u003dandroid-21\n-DANDROID_ABI\u003d$ABI\n-DCMAKE_ANDROID_ARCH_ABI\u003d$ABI\n-DANDROID_NDK\u003d$NDK\n-DCMAKE_ANDROID_NDK\u003d$NDK\n-DCMAKE_TOOLCHAIN_FILE\u003d$NDK/build/cmake/android.toolchain.cmake\n-DCMAKE_MAKE_PROGRAM\u003d$NINJA\n-DCMAKE_LIBRARY_OUTPUT_DIRECTORY\u003d$PROJECT/sdk/build/intermediates/cxx/Debug/$HASH/obj/$ABI\n-DCMAKE_RUNTIME_OUTPUT_DIRECTORY\u003d$PROJECT/sdk/build/intermediates/cxx/Debug/$HASH/obj/$ABI\n-DCMAKE_BUILD_TYPE\u003dDebug\n-B$PROJECT/sdk/.cxx/Debug/$HASH/$ABI\n-GNinja\n-DANDROID_STL\u003dc++_shared",
   "configurationArguments": [
-    "-HD:\\MyOCR\\sdk\\libcxx_helper",
+    "-HD:\\MyOCR\\MyOCR\\sdk\\libcxx_helper",
     "-DCMAKE_SYSTEM_NAME\u003dAndroid",
     "-DCMAKE_EXPORT_COMPILE_COMMANDS\u003dON",
     "-DCMAKE_SYSTEM_VERSION\u003d21",
@@ -179,13 +177,13 @@
     "-DCMAKE_ANDROID_NDK\u003dC:\\Users\\quang\\AppData\\Local\\Android\\Sdk\\ndk\\26.1.10909125",
     "-DCMAKE_TOOLCHAIN_FILE\u003dC:\\Users\\quang\\AppData\\Local\\Android\\Sdk\\ndk\\26.1.10909125\\build\\cmake\\android.toolchain.cmake",
     "-DCMAKE_MAKE_PROGRAM\u003dC:\\Users\\quang\\AppData\\Local\\Android\\Sdk\\cmake\\3.22.1\\bin\\ninja.exe",
-    "-DCMAKE_LIBRARY_OUTPUT_DIRECTORY\u003dD:\\MyOCR\\sdk\\build\\intermediates\\cxx\\Debug\\132a2g45\\obj\\x86",
-    "-DCMAKE_RUNTIME_OUTPUT_DIRECTORY\u003dD:\\MyOCR\\sdk\\build\\intermediates\\cxx\\Debug\\132a2g45\\obj\\x86",
+    "-DCMAKE_LIBRARY_OUTPUT_DIRECTORY\u003dD:\\MyOCR\\MyOCR\\sdk\\build\\intermediates\\cxx\\Debug\\132a2g45\\obj\\x86",
+    "-DCMAKE_RUNTIME_OUTPUT_DIRECTORY\u003dD:\\MyOCR\\MyOCR\\sdk\\build\\intermediates\\cxx\\Debug\\132a2g45\\obj\\x86",
     "-DCMAKE_BUILD_TYPE\u003dDebug",
-    "-BD:\\MyOCR\\sdk\\.cxx\\Debug\\132a2g45\\x86",
+    "-BD:\\MyOCR\\MyOCR\\sdk\\.cxx\\Debug\\132a2g45\\x86",
     "-GNinja",
     "-DANDROID_STL\u003dc++_shared"
   ],
   "stlLibraryFile": "C:\\Users\\quang\\AppData\\Local\\Android\\Sdk\\ndk\\26.1.10909125\\toolchains\\llvm\\prebuilt\\windows-x86_64\\sysroot\\usr\\lib\\i686-linux-android\\libc++_shared.so",
-  "intermediatesParentFolder": "D:\\MyOCR\\sdk\\build\\intermediates\\cxx\\Debug\\132a2g45"
+  "intermediatesParentFolder": "D:\\MyOCR\\MyOCR\\sdk\\build\\intermediates\\cxx\\Debug\\132a2g45"
 }

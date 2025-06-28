@@ -1,6 +1,6 @@
 @echo off
 "C:\\Users\\quang\\AppData\\Local\\Android\\Sdk\\cmake\\3.22.1\\bin\\cmake.exe" ^
-  "-HD:\\MyOCR\\sdk\\libcxx_helper" ^
+  "-HD:\\MyOCR\\MyOCR\\sdk\\libcxx_helper" ^
   "-DCMAKE_SYSTEM_NAME=Android" ^
   "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON" ^
   "-DCMAKE_SYSTEM_VERSION=21" ^
@@ -11,9 +11,9 @@
   "-DCMAKE_ANDROID_NDK=C:\\Users\\quang\\AppData\\Local\\Android\\Sdk\\ndk\\26.1.10909125" ^
   "-DCMAKE_TOOLCHAIN_FILE=C:\\Users\\quang\\AppData\\Local\\Android\\Sdk\\ndk\\26.1.10909125\\build\\cmake\\android.toolchain.cmake" ^
   "-DCMAKE_MAKE_PROGRAM=C:\\Users\\quang\\AppData\\Local\\Android\\Sdk\\cmake\\3.22.1\\bin\\ninja.exe" ^
-  "-DCMAKE_LIBRARY_OUTPUT_DIRECTORY=D:\\MyOCR\\sdk\\build\\intermediates\\cxx\\Debug\\132a2g45\\obj\\arm64-v8a" ^
-  "-DCMAKE_RUNTIME_OUTPUT_DIRECTORY=D:\\MyOCR\\sdk\\build\\intermediates\\cxx\\Debug\\132a2g45\\obj\\arm64-v8a" ^
+  "-DCMAKE_LIBRARY_OUTPUT_DIRECTORY=D:\\MyOCR\\MyOCR\\sdk\\build\\intermediates\\cxx\\Debug\\132a2g45\\obj\\arm64-v8a" ^
+  "-DCMAKE_RUNTIME_OUTPUT_DIRECTORY=D:\\MyOCR\\MyOCR\\sdk\\build\\intermediates\\cxx\\Debug\\132a2g45\\obj\\arm64-v8a" ^
   "-DCMAKE_BUILD_TYPE=Debug" ^
-  "-BD:\\MyOCR\\sdk\\.cxx\\Debug\\132a2g45\\arm64-v8a" ^
+  "-BD:\\MyOCR\\MyOCR\\sdk\\.cxx\\Debug\\132a2g45\\arm64-v8a" ^
   -GNinja ^
   "-DANDROID_STL=c++_shared"

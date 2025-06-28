@@ -123,6 +123,7 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
     private int currentOcrIndex = -1;
     private volatile boolean stopOcrRequested = false;
     private Call currentOcrCall;
+    private VietOcr vietOcr;
 
     private OrtEnvironment ortEnv;
     private OrtSession ortSession;
@@ -300,7 +301,7 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
         fab.setOnClickListener(view -> showImageSourceDialog());
 
         // Disable Vietnamese option as vocab is missing
-        radioVietnamese.setEnabled(false);
+        radioVietnamese.setEnabled(true);
 
         // Đặt trạng thái radio theo ngôn ngữ đã lưu
         if ("vi".equals(lang)) {
@@ -429,22 +430,20 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
             Toast.makeText(this, "Please select images first.", Toast.LENGTH_SHORT).show();
             return;
         }
-        
+
         // Lazy load the models on first OCR run
-        if (detectionSession == null || englishRecognitionSession == null || vietnameseVocab == null) {
+        if (detectionSession == null || englishRecognitionSession == null || vietOcr == null) {
              Toast.makeText(this, "Loading models, please wait...", Toast.LENGTH_LONG).show();
              new Thread(() -> {
                  try {
-                    // Load models and vocab
+                    // Load English models
                     detectionSession = ortEnv.createSession(assetFilePath("db_mobilenet_v3_large.onnx"), new OrtSession.SessionOptions());
                     englishRecognitionSession = ortEnv.createSession(assetFilePath("crnn_mobilenet_v3_large.onnx"), new OrtSession.SessionOptions());
-                    
-                    // Load Vietnamese vocab - DISABLED for now
-                    // try (InputStream is = getAssets().open("vi_vocab.txt")) {
-                    //    vietnameseVocab = new Vocab(new String(getBytes(is)));
-                    // }
-                    
-                    Log.d("OcrDebugging", "Detection Model Output Nodes: " + detectionSession.getOutputInfo().keySet().toString());
+
+                    // Load Vietnamese models by initializing VietOcr class
+                    vietOcr = new VietOcr(MainActivity.this);
+
+                    Log.d("OcrDebugging", "All models loaded successfully.");
                     
                     runOnUiThread(() -> {
                          Toast.makeText(MainActivity.this, "Models loaded. Starting OCR.", Toast.LENGTH_SHORT).show();
@@ -469,12 +468,15 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
         }
         ocrResultAdapter.notifyDataSetChanged();
         
+        // Get the language choice from UI thread here, before starting background processing
+        final String selectedLang = radioVietnamese.isChecked() ? "vi" : "en";
+
         currentOcrIndex = 0;
         updateOcrUiState(true);
-        processNextImage();
+        processNextImage(selectedLang);
     }
     
-    private void processNextImage() {
+    private void processNextImage(final String lang) {
         if (stopOcrRequested) {
              updateOcrUiState(false);
              Toast.makeText(this, "OCR stopped by user.", Toast.LENGTH_SHORT).show();
@@ -482,7 +484,7 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
         }
         if (currentOcrIndex < imageUris.size()) {
             Uri imageUri = imageUris.get(currentOcrIndex);
-            performOcrForImage(imageUri, currentOcrIndex);
+            performOcrForImage(imageUri, currentOcrIndex, lang);
         } else {
             // All images processed
             updateOcrUiState(false);
@@ -493,11 +495,10 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
         }
     }
     
-    private void performOcrForImage(Uri imageUri, final int position) {
+    private void performOcrForImage(Uri imageUri, final int position, final String selectedLang) {
         new Thread(() -> {
             Page resultPage = null;
             try {
-                // 1. Load and pre-process the original bitmap
                 Bitmap originalBitmap = BitmapFactory.decodeStream(getContentResolver().openInputStream(imageUri));
                 Mat originalMat = new Mat();
                 Utils.bitmapToMat(originalBitmap, originalMat);
@@ -505,37 +506,18 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
                 Bitmap cleanedBitmap = Bitmap.createBitmap(originalMat.cols(), originalMat.rows(), Bitmap.Config.ARGB_8888);
                 Utils.matToBitmap(originalMat, cleanedBitmap);
 
-                // 2. Run Detection to get word boxes
+                // Common steps for both languages
                 List<RotatedRect> detectionBoxes = runDetection(cleanedBitmap);
-                Log.d("OcrDebugging", "Found " + detectionBoxes.size() + " boxes in detection phase.");
-
-                // 3. Group detected boxes into lines (still using WordBox for geometry grouping)
+                Log.d("OcrDebugging", "Found " + detectionBoxes.size() + " boxes in detection phase for lang: " + selectedLang);
                 List<List<WordBox>> lineWordBoxes = resolveLines(detectionBoxes);
 
-                // 4. Initialize session and models
-                OrtSession sessionToUse;
-                Vocab vocabToUse;
-                String selectedLang = radioVietnamese.isChecked() ? "vi" : "en";
-                if ("vi".equals(selectedLang) && ortSession != null && vietnameseVocab != null) {
-                    sessionToUse = ortSession;
-                    vocabToUse = vietnameseVocab;
-                } else {
-                    sessionToUse = englishRecognitionSession;
-                    vocabToUse = englishVocab;
-                }
-                if (sessionToUse == null || vocabToUse == null) {
-                    throw new IOException("Models or vocabulary for the selected language are not loaded.");
-                }
-
-                // 5. Sequentially recognize words line by line and build data objects
+                List<Line> resolvedLines = new ArrayList<>();
                 Mat originalMatForCropping = new Mat();
                 Utils.bitmapToMat(cleanedBitmap, originalMatForCropping);
-                List<Line> resolvedLines = new ArrayList<>();
 
                 for (List<WordBox> wordBoxLine : lineWordBoxes) {
                     List<Word> wordsInLine = new ArrayList<>();
                     for (WordBox wordBox : wordBoxLine) {
-                        // --- Recognition logic for each word ---
                         Rect uprightBox = wordBox.box.boundingRect();
                         int x = Math.max(0, uprightBox.x);
                         int y = Math.max(0, uprightBox.y);
@@ -549,22 +531,24 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
                         Bitmap croppedBitmap = Bitmap.createBitmap(croppedMat.cols(), croppedMat.rows(), Bitmap.Config.ARGB_8888);
                         Utils.matToBitmap(croppedMat, croppedBitmap);
 
-                        FloatBuffer recInputBuffer = preprocessImageForRecognition(croppedBitmap);
-                        long[] recShape = {1, 3, 32, 128};
-
                         String recognizedText = "";
-                        double confidence = 0.0; // Placeholder
+                        double confidence = 0.95; // Placeholder confidence
 
-                        try (OnnxTensor recInputTensor = OnnxTensor.createTensor(ortEnv, recInputBuffer, recShape)) {
-                            OrtSession.Result recResult = sessionToUse.run(Collections.singletonMap("input", recInputTensor));
-                            float[][][] recOutput = (float[][][]) recResult.get(0).getValue();
-                            recognizedText = vocabToUse.decode(recOutput);
-                            // TODO: Extract confidence from recOutput if possible
-                            confidence = 0.95; // Using a placeholder for now
+                        if ("vi".equals(selectedLang)) {
+                            if (vietOcr == null) throw new IOException("Vietnamese OCR model is not initialized.");
+                            recognizedText = vietOcr.predict(croppedBitmap);
+                        } else {
+                            if (englishRecognitionSession == null || englishVocab == null) throw new IOException("English OCR model is not initialized.");
+                            FloatBuffer recInputBuffer = preprocessImageForRecognition(croppedBitmap);
+                            long[] recShape = {1, 3, 32, 128};
+                            try (OnnxTensor recInputTensor = OnnxTensor.createTensor(ortEnv, recInputBuffer, recShape)) {
+                                OrtSession.Result recResult = englishRecognitionSession.run(Collections.singletonMap("input", recInputTensor));
+                                float[][][] recOutput = (float[][][]) recResult.get(0).getValue();
+                                recognizedText = englishVocab.decode(recOutput);
+                            }
                         }
-                        
-                        wordsInLine.add(new Word(recognizedText, confidence, wordBox.box));
 
+                        wordsInLine.add(new Word(recognizedText, confidence, wordBox.box));
                         croppedMat.release();
                         croppedBitmap.recycle();
                     }
@@ -576,10 +560,8 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
                 }
                 originalMatForCropping.release();
 
-                // 6. Group resolved lines into blocks
+                // Common steps for both languages
                 List<Block> resolvedBlocks = resolveBlocks(resolvedLines);
-
-                // 7. Create the final Page object
                 Bitmap finalPreviewBitmap = createPreviewWithBlocks(originalBitmap, resolvedBlocks);
                 resultPage = new Page(resolvedBlocks, position, originalBitmap.getWidth(), originalBitmap.getHeight(), finalPreviewBitmap);
 
@@ -594,7 +576,7 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
 
             // 8. Update UI with the final Page object
             final Page finalResultPage = resultPage;
-            final String errorMessage = (resultPage.getBlocks().isEmpty() || resultPage.getBlocks().get(0).getLines().isEmpty())
+            final String errorMessage = (resultPage != null && resultPage.getBlocks().isEmpty() || (resultPage != null && resultPage.getBlocks().get(0).getLines().isEmpty()))
                 ? "Error during OCR process." : null;
             
             runOnUiThread(() -> {
@@ -603,7 +585,7 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
                 } else {
                      updateOcrResult(position, finalResultPage, false);
                 }
-                triggerNextImageProcessing();
+                triggerNextImageProcessing(selectedLang);
             });
 
         }).start();
@@ -631,6 +613,16 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
                 MatOfPoint linePoints = new MatOfPoint(lineVertices);
                 Imgproc.polylines(previewMat, Collections.singletonList(linePoints), true, new Scalar(0, 255, 0), 2); // Green for lines
                 linePoints.release();
+
+                // Draw words in BLUE
+                for(Word word : line.getWords()){
+                    RotatedRect wordBox = word.getGeometry();
+                    Point[] wordVertices = new Point[4];
+                    wordBox.points(wordVertices);
+                    MatOfPoint wordPoints = new MatOfPoint(wordVertices);
+                    Imgproc.polylines(previewMat, Collections.singletonList(wordPoints), true, new Scalar(0, 0, 255), 1); // Blue for words
+                    wordPoints.release();
+                }
             }
         }
         Utils.matToBitmap(previewMat, previewBitmap);
@@ -1158,10 +1150,10 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
         }
     }
 
-    private void triggerNextImageProcessing() {
+    private void triggerNextImageProcessing(String lang) {
         currentOcrIndex++;
         progressBar.setProgress((int) (((float) currentOcrIndex / imageUris.size()) * 100));
-        processNextImage();
+        processNextImage(lang);
     }
     
     private void setLocale(String langCode) {
@@ -1493,6 +1485,7 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
         super.onDestroy();
         // Close OrtSession and OrtEnvironment to free resources
         try {
+            if (vietOcr != null) vietOcr.close();
             if (ortSession != null) ortSession.close();
             if (detectionSession != null) detectionSession.close();
             if (englishRecognitionSession != null) englishRecognitionSession.close();

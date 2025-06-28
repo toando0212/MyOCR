@@ -6,37 +6,20 @@ import java.util.List;
 import java.util.Map;
 
 public class Vocab {
-    // These values MUST match the token IDs used during the model's training in Python
-    // SOS, EOS, PAD tokens are added AFTER the main vocabulary
-    public final int SOS;
-    public final int EOS;
-    public final int PAD;
-
+    // --- THUỘC TÍNH THUẦN CTC ---
     public final Map<Integer, String> i2c = new HashMap<>();
     public final Map<String, Integer> c2i = new HashMap<>();
-    private int n_words = 0;
     private final int blankIndex;
 
     public Vocab(String chars) {
-        // For CTC models like ViTSTR, the vocabulary consists only of the printable characters.
-        // The special "blank" token is handled implicitly by the model and decoder.
+        // 1. Chỉ thêm các ký tự từ chuỗi vocab được cung cấp
         for (char c : chars.toCharArray()) {
             addWord(String.valueOf(c));
         }
-        // The blank token is assumed to have an index equal to the number of characters.
-        // e.g., if there are 95 chars (0-94), blank is 95.
+        
+        // 2. Index của blank token sẽ là index ngay sau ký tự cuối cùng.
+        // Ví dụ: nếu có 200 ký tự (index 0-199), blankIndex sẽ là 200.
         blankIndex = c2i.size();
-
-        // 2. Add special tokens AFTER the character vocabulary.
-        // Their indices must match the Python implementation (len(vocab), len(vocab)+1, ...)
-        SOS = n_words;
-        addWord("<s>");   // SOS will have the index of len(chars)
-
-        EOS = n_words;
-        addWord("</s>");  // EOS will have the index of len(chars) + 1
-
-        PAD = n_words;
-        addWord("<pad>");  // PAD will have the index of len(chars) + 2
     }
 
     private void addWord(String word) {
@@ -44,7 +27,6 @@ public class Vocab {
             int index = c2i.size();
             c2i.put(word, index);
             i2c.put(index, word);
-            n_words++;
         }
     }
 
@@ -100,11 +82,10 @@ public class Vocab {
         return sb.toString();
     }
 
+    // Hàm này không còn cần thiết vì model đã được build với vocab cố định,
+    // nhưng giữ lại cũng không sao.
     public int getVocabSize() {
-        // For a CTC model, the output layer of the network has a size equal to
-        // the number of characters in the vocabulary plus one for the special "blank" token.
-        // For example, if your vocabulary has 95 characters (indices 0-94),
-        // the blank token will have index 95, and the model's output dimension will be 96.
+        // Kích thước output của model CTC = số ký tự + 1 (cho blank token)
         return c2i.size() + 1;
     }
 } 
