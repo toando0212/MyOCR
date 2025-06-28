@@ -1,252 +1,218 @@
-from PIL import Image, ImageDraw, ImageFont
 import gradio as gr
 import numpy as np
-import os
+from PIL import Image, ImageDraw, ImageFont
+import onnxruntime as ort
 import cv2
-import torch
-from doctr.models import ocr_predictor
-from doctr.io import DocumentFile
-import logging
-import sys
-import math
-from vietocr.tool.predictor import Predictor
-from vietocr.tool.config import Cfg
 from pyvi import ViTokenizer
-from pipeline_utils import correct_perspective, deskew_image, remove_horizontal_lines
+from doctr.models.recognition.crnn import crnn_mobilenet_v3_large
+import torch
+from torchvision import transforms
+import pyclipper
 
-# Set up logging to force output to console
-for handler in logging.root.handlers[:]:
-    logging.root.removeHandler(handler)
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    stream=sys.stdout
-)
-logger = logging.getLogger(__name__)
+VOCAB = list("aAàÀảẢãÃáÁạẠăĂằẰẳẲẵẴắẮặẶâÂầẦẩẨẫẪấẤậẬbBcCdDđĐeEèÈẻẺẽẼéÉẹẸêÊềỀểỂễỄếẾệỆfFgGhHiIìÌỉỈĩĨíÍịỊjJkKlLmMnNoOòÒỏỎõÕóÓọỌôÔồỒổỔỗỖốỐộỘơƠờỜởỞỡỠớỚợỢpPqQrRsStTuUùÙủỦũŨúÚụỤưƯừỪửỬữỮứỨựỰvVwWxXyYỳỲỷỶỹỸýÝỵỴzZ0123456789!\"#$%&''()*+,-./:;<=>?@[\\]^_`{|}~")
+# --- Perspective transform from 4 points ---
+def four_point_transform(image, pts):
+    pts = np.array(pts, dtype="float32")
+    (tl, tr, br, bl) = pts
+    widthA = np.linalg.norm(br - bl)
+    widthB = np.linalg.norm(tr - tl)
+    maxWidth = int(max(widthA, widthB))
+    heightA = np.linalg.norm(tr - br)
+    heightB = np.linalg.norm(tl - bl)
+    maxHeight = int(max(heightA, heightB))
+    dst = np.array([
+        [0, 0],
+        [maxWidth - 1, 0],
+        [maxWidth - 1, maxHeight - 1],
+        [0, maxHeight - 1]], dtype="float32")
+    M = cv2.getPerspectiveTransform(pts, dst)
+    warped = cv2.warpPerspective(np.array(image), M, (maxWidth, maxHeight))
+    return Image.fromarray(warped)
 
-logger.info("Starting the Unified OCR pipeline application...")
+# --- DBNet Detector ---
+class DBNetDetector:
+    def __init__(self, onnx_path, bin_thresh=0.3, box_thresh=0.1, unclip_ratio=1.5):
+        self.session = ort.InferenceSession(onnx_path, providers=['CPUExecutionProvider'])
+        self.bin_thresh = bin_thresh
+        self.box_thresh = box_thresh
+        self.unclip_ratio = unclip_ratio
 
-try:
-    # Load VietOCR model for recognition
-    logger.info("Loading VietOCR model (vgg_seq2seq)...")
-    config = Cfg.load_config_from_name('vgg_transformer')
-    config['device'] = 'cpu' # Force CPU for compatibility
-    config['predictor']['beamsearch'] = False
-    vietocr_predictor = Predictor(config)
-    logger.info("VietOCR model loaded successfully!")
-
-    # Load Doctr predictor for line detection only
-    # The recognition architecture is specified but won't be used because we call with detect_only=True
-    logger.info("Initializing DocTR predictor for line detection...")
-    doctr_predictor = ocr_predictor(det_arch='fast_small', pretrained=True)
-    logger.info("DocTR predictor loaded successfully!")
-
-except Exception as e:
-    logger.error(f"Error during model initialization: {str(e)}", exc_info=True)
-    raise
-
-def merge_boxes_to_lines(boxes: list, page_dims: tuple, tolerance_ratio: float = 0.7) -> list:
-    """
-    Merges bounding boxes into lines of text, which is crucial for handwriting.
-    
-    Args:
-        boxes: A list of bounding boxes, each defined as (xmin, ymin, xmax, ymax)
-               in relative coordinates (0 to 1).
-        page_dims: A tuple (height, width) of the page.
-        tolerance_ratio: The vertical tolerance for merging boxes into the same line,
-                         as a ratio of the box height.
-    
-    Returns:
-        A list of merged bounding boxes representing text lines in absolute coordinates.
-    """
-    if not boxes:
-        return []
-
-    page_height, page_width = page_dims
-    # Convert boxes to absolute coordinates and include their height for sorting
-    abs_boxes = [
-        (int(b[0] * page_width), int(b[1] * page_height), int(b[2] * page_width), int(b[3] * page_height))
-        for b in boxes
-    ]
-
-    # Sort boxes primarily by their vertical position, then horizontal
-    sorted_boxes = sorted(abs_boxes, key=lambda x: (x[1], x[0]))
-
-    merged_lines = []
-    if not sorted_boxes:
-        return []
-
-    current_line = list(sorted_boxes[0])
-
-    for i in range(1, len(sorted_boxes)):
-        box = sorted_boxes[i]
-        
-        current_line_height = current_line[3] - current_line[1]
-        current_line_y_center = current_line[1] + current_line_height / 2
-        
-        box_height = box[3] - box[1]
-        box_y_center = box[1] + box_height / 2
-
-        vertical_tolerance = min(current_line_height, box_height) * tolerance_ratio
-
-        # Check if the box y-center is within the vertical tolerance of the current line's y-center
-        if abs(box_y_center - current_line_y_center) <= vertical_tolerance:
-            # Merge box into current line by expanding the line's bounding box
-            current_line[0] = min(current_line[0], box[0])
-            current_line[1] = min(current_line[1], box[1])
-            current_line[2] = max(current_line[2], box[2])
-            current_line[3] = max(current_line[3], box[3])
+    def preprocess(self, pil_img):
+        img = pil_img.convert('RGB')
+        w, h = img.size
+        target_size = 512
+        ratio = w / h
+        if ratio > 1:
+            resized_w = target_size
+            resized_h = int(target_size / ratio)
         else:
-            merged_lines.append(tuple(current_line))
-            current_line = list(box)
+            resized_h = target_size
+            resized_w = int(target_size * ratio)
+        resized_w = max(1, resized_w)
+        resized_h = max(1, resized_h)
+        pad_left = (target_size - resized_w) // 2
+        pad_top = (target_size - resized_h) // 2
+        img_resized = img.resize((resized_w, resized_h), Image.BILINEAR)
+        new_img = Image.new('RGB', (target_size, target_size), (0,0,0))
+        new_img.paste(img_resized, (pad_left, pad_top))
+        img_np = np.array(new_img).astype(np.float32) / 255.0
+        mean = np.array([0.485, 0.456, 0.406])
+        std = np.array([0.229, 0.224, 0.225])
+        img_np = (img_np - mean) / std
+        img_np = img_np.transpose(2, 0, 1)
+        img_np = np.expand_dims(img_np, 0)
+        print(f"[DBNet] preprocess: orig_size={w}x{h}, resized={resized_w}x{resized_h}, pad_left={pad_left}, pad_top={pad_top}")
+        return img_np.astype(np.float32), (w, h), resized_w, resized_h, pad_left, pad_top
 
-    merged_lines.append(tuple(current_line))
-    
-    return merged_lines
+    def unclip_polygon(self, contour):
+        area = cv2.contourArea(contour)
+        length = cv2.arcLength(contour, True)
+        if length == 0:
+            return None
+        distance = area * self.unclip_ratio / (length + 1e-6)
+        poly = contour.squeeze().astype(np.int32)
+        pc = pyclipper.PyclipperOffset()
+        pc.AddPath(poly, pyclipper.JT_ROUND, pyclipper.ET_CLOSEDPOLYGON)
+        expanded = pc.Execute(distance)
+        if len(expanded) == 0:
+            return None
+        return np.array(expanded[0]).reshape(-1, 2)
 
-def post_process_text(text: str) -> str:
-    """
-    Correctly segments Vietnamese words using pyvi.
-    """
-    logger.info("Starting post-processing (Vietnamese word segmentation)...")
-    try:
-        # Tokenize the text to add underscores between compound words
-        tokenized_text = ViTokenizer.tokenize(text)
-        # Replace underscores with spaces for better readability
-        readable_text = tokenized_text.replace('_', ' ')
-        logger.info("Post-processing completed.")
-        return readable_text
-    except Exception as e:
-        logger.error(f"Error during post-processing: {e}", exc_info=True)
-        return text # Return original text on error
+    def box_score(self, prob_map, polygon):
+        mask = np.zeros(prob_map.shape, dtype=np.uint8)
+        cv2.fillPoly(mask, [polygon.astype(np.int32)], 1)
+        return float(np.mean(prob_map[mask == 1]))
 
-@torch.no_grad()
-def ocr_pipeline(pil_img):
-    logger.info("OCR pipeline started.")
-    if pil_img is None:
-        # Return empty values for all outputs
-        return "Please upload an image.", "", None, None, None, None
-
-    try:
-        # Step 1: Preprocessing
-        logger.info("Step 1: Correcting perspective...")
-        corrected_img = correct_perspective(pil_img)
-
-        logger.info("Step 2: Deskewing image...")
-        deskewed_img = deskew_image(corrected_img)
-        
-        logger.info("Step 3: Removing horizontal lines...")
-        processed_img_for_detection = remove_horizontal_lines(deskewed_img)
-        
-        # Step 4: Line Detection using DocTR
-        logger.info("Step 4: Running DocTR to detect lines (recognition results will be replaced)...")
-        img_array = np.array(processed_img_for_detection.convert("RGB"))
-        
-        # Run full OCR with DocTR. We will use its detection results (bounding boxes)
-        # and then use VietOCR for the actual text recognition. This avoids the 'detect_only' error.
-        result = doctr_predictor([img_array])
-        
-        if not result.pages or not result.pages[0].blocks:
-            logger.warning("No text boxes detected by DocTR.")
-            # Return intermediate images for debugging
-            return "No text boxes detected.", "", corrected_img, deskewed_img, processed_img_for_detection, deskewed_img.copy().convert("RGB")
-
-        # Step 4a: Extract all detected boxes from DocTR
-        logger.info("Step 4a: Extracting individual boxes from DocTR result...")
-        page = result.pages[0]
-        page_dims = page.dimensions # (height, width)
-        all_boxes = []
-        for block in page.blocks:
-            for line in block.lines:
-                all_boxes.append((line.geometry[0][0], line.geometry[0][1], line.geometry[1][0], line.geometry[1][1]))
-
-        # Step 4b: Merge boxes into lines
-        logger.info("Step 4b: Merging detected boxes into lines for handwriting...")
-        merged_line_boxes = merge_boxes_to_lines(all_boxes, page_dims)
-        if not merged_line_boxes:
-            logger.warning("Box merging resulted in no lines. OCR will be empty.")
-            return "Box merging failed to create any lines.", "", corrected_img, deskewed_img, processed_img_for_detection, deskewed_img.copy().convert("RGB")
-
-        # Step 5: Text Recognition using VietOCR on MERGED lines
-        logger.info("Step 5: Recognizing text with VietOCR on merged lines...")
-        recognized_results = []
-        
-        for line_box in merged_line_boxes:
-            # Crop the line from the clean, deskewed image for best recognition results
-            line_crop = deskewed_img.crop(line_box)
-            
-            # Recognize text using VietOCR
-            if line_crop.width > 0 and line_crop.height > 0:
-                try:
-                    line_text = vietocr_predictor.predict(line_crop)
-                except Exception as recog_e:
-                    logger.warning(f"VietOCR failed to recognize a line crop: {recog_e}")
-                    line_text = "" # Assign empty string on failure
-            else:
-                line_text = ""
-
-            if not line_text:
-                logger.debug("Skipping line due to empty recognition result.")
+    def postprocess(self, pred, orig_size, resized_w, resized_h, pad_left, pad_top):
+        pred = pred[0, 0]
+        # Apply sigmoid
+        prob_map = 1 / (1 + np.exp(-pred))
+        # Binarize
+        mask = prob_map > self.bin_thresh
+        mask = mask.astype(np.uint8) * 255
+        contours, _ = cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        boxes = []
+        h, w = prob_map.shape
+        scale_w = orig_size[0] / resized_w
+        scale_h = orig_size[1] / resized_h
+        for cnt in contours:
+            if cv2.contourArea(cnt) < 2:
                 continue
-            
-            recognized_results.append({
-                'box': line_box, 
-                'text': line_text, 
-            })
-            logger.info(f"Recognized Line: {line_text}")
-        
-        # Step 6: Create visualization on the deskewed image
-        logger.info("Step 6: Creating visualization...")
-        vis_img = deskewed_img.copy().convert("RGB")
-        draw = ImageDraw.Draw(vis_img)
-        
-        for res in recognized_results:
-            box, text = res['box'], res['text']
-            draw.rectangle(box, outline="blue", width=2)
-            
-            # Position text above the bounding box
-            text_position = (box[0], box[1] - 15 if box[1] > 15 else box[1])
-            
+            # --- Unclip/expand contour bằng pyclipper ---
             try:
-                # Use a common font if available
+                cnt_expanded = self.unclip_polygon(cnt)
+            except Exception:
+                cnt_expanded = None
+            if cnt_expanded is None or len(cnt_expanded) < 4:
+                continue
+            rect = cv2.minAreaRect(cnt_expanded)
+            box = cv2.boxPoints(rect)
+            box = np.array(box)
+            # Calculate confidence score giống Doctr
+            score = self.box_score(prob_map, cnt_expanded)
+            if score < self.box_thresh:
+                continue
+            # Scale box về ảnh gốc
+            box[:,0] = (box[:,0] - pad_left) * scale_w
+            box[:,1] = (box[:,1] - pad_top) * scale_h
+            boxes.append(box.astype(np.int32))
+        return boxes
+
+    def detect(self, pil_img):
+        img_np, orig_size, resized_w, resized_h, pad_left, pad_top = self.preprocess(pil_img)
+        ort_inputs = {self.session.get_inputs()[0].name: img_np}
+        pred = self.session.run(None, ort_inputs)[0]
+        boxes = self.postprocess(pred, orig_size, resized_w, resized_h, pad_left, pad_top)
+        return boxes
+
+# --- Post-process Vietnamese text ---
+def post_process_text(text: str) -> str:
+    try:
+        tokenized_text = ViTokenizer.tokenize(text)
+        readable_text = tokenized_text.replace('_', ' ')
+        return readable_text
+    except Exception:
+        return text
+
+# --- PyTorch CRNN Recognizer ---
+crnn_model = crnn_mobilenet_v3_large(pretrained=False, vocab=VOCAB)
+# crnn_model = crnn_model.cuda()
+checkpoint = torch.load("best_checkpoint_printed3.pth", map_location="cpu")
+crnn_model.load_state_dict(checkpoint["model_state_dict"])
+crnn_model.eval()
+
+crnn_transform = transforms.Compose([
+    transforms.Resize((32, 128)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
+])
+
+def recognize_pytorch(img_pil):
+    img = crnn_transform(img_pil.convert("RGB")).unsqueeze(0)
+    with torch.no_grad():
+        out = crnn_model(img)
+    preds = out["preds"]
+    text, conf = preds[0]
+    return text
+
+# --- Instantiate models ---
+dbnet_detector = DBNetDetector("db_mobilenet_v3_large.onnx")
+
+# --- Main pipeline ---
+def ocr_pipeline(img):
+    if img is None:
+        return "Vui lòng upload ảnh!", None
+    if isinstance(img, np.ndarray):
+        img = Image.fromarray(img)
+    print(f"[OCR] Input image size: {img.size}")
+    boxes = dbnet_detector.detect(img)
+    print(f"[OCR] Number of detected boxes: {len(boxes)}")
+    results = []
+    vis_img = img.copy().convert("RGB")
+    draw = ImageDraw.Draw(vis_img)
+    for box in boxes:
+        xmin = int(np.min(box[:,0]))
+        xmax = int(np.max(box[:,0]))
+        ymin = int(np.min(box[:,1]))
+        ymax = int(np.max(box[:,1]))
+        print(f"[OCR] Crop box: ({xmin},{ymin})-({xmax},{ymax})")
+        if xmax-xmin<5 or ymax-ymin<5:
+            continue
+        # --- Expand box by 10% each side ---
+        w = xmax - xmin
+        h = ymax - ymin
+        expand_w = int(w * 0.1)
+        expand_h = int(h * 0.1)
+        xmin_exp = max(0, xmin - expand_w)
+        ymin_exp = max(0, ymin - expand_h)
+        xmax_exp = min(img.width, xmax + expand_w)
+        ymax_exp = min(img.height, ymax + expand_h)
+        crop = img.crop((xmin_exp, ymin_exp, xmax_exp, ymax_exp))
+        text = recognize_pytorch(crop)
+        if text.strip():
+            results.append((box, text))
+            draw.polygon([tuple(pt) for pt in box], outline="blue")
+            try:
                 font = ImageFont.truetype("arial.ttf", 15)
-            except IOError:
-                # Fallback to default font
+            except:
                 font = ImageFont.load_default()
-                
-            draw.text(text_position, text, fill="blue", font=font)
-        
-        out_text = "\n".join([r['text'] for r in recognized_results])
-        logger.info("OCR pipeline completed successfully.")
-        
-        # Step 7: Post-processing
-        post_processed_text = post_process_text(out_text)
-        
-        return out_text, post_processed_text, corrected_img, deskewed_img, processed_img_for_detection, vis_img
+            draw.text((xmin, ymin-15 if ymin>15 else ymin), text, fill="blue", font=font)
+    out_text = '\n'.join([t for _,t in results])
+    post_text = post_process_text(out_text)
+    print(f"[OCR] Final recognized text: {post_text}")
+    return post_text, vis_img
 
-    except Exception as e:
-        error_msg = f"Error in OCR pipeline: {str(e)}"
-        logger.error(error_msg, exc_info=True)
-        # Return original image in the last slot on error, and Nones for the rest
-        return error_msg, "", None, None, None, pil_img
-
-# Create Gradio interface
+# --- Gradio interface ---
 demo = gr.Interface(
     fn=ocr_pipeline,
-    inputs=gr.Image(type="pil", label="Upload Document Image"),
+    inputs=gr.Image(label="Upload ảnh tài liệu"),
     outputs=[
-        gr.Textbox(label="1. Raw Recognized Text"),
-        gr.Textbox(label="2. Post-Processed Text (Word Segmented)"),
-        gr.Image(type="pil", label="3. Perspective Corrected"),
-        gr.Image(type="pil", label="4. Deskewed"),
-        gr.Image(type="pil", label="5. Preprocessed (Lines Removed)"),
-        gr.Image(type="pil", label="6. Final Result (Boxes on Deskewed Image)")
+        gr.Textbox(label="Kết quả nhận diện (word-level, đã word segment)", lines=10),
+        gr.Image(type="pil", label="Ảnh kết quả (box + text)")
     ],
-    title="Vietnamese OCR Pipeline: Preprocessing, Recognition, and Post-processing",
-    description="Shows the output of each step. 1. Perspective Correction -> 2. Rotational Deskew -> 3. Line Removal -> 4. Line Detection (DocTR) -> 4b. Box Merging -> 5. Recognition (VietOCR) -> 6. Post-processing (Word Segmentation)."
+    title="Vietnamese OCR Pipeline (DBNet+CRNN ONNX)",
+    description="1. Upload ảnh. 2. Detect word-level box bằng DBNet ONNX. 3. Recognize từng box bằng CRNN ONNX."
 )
 
 if __name__ == "__main__":
-    logger.info("Starting Gradio interface...")
-    demo.launch(debug=True, server_name="0.0.0.0", server_port=7862)
-    logger.info("Gradio interface running at http://0.0.0.0:7862") 
+    demo.launch(debug=True, server_name="0.0.0.0", server_port=7862) 

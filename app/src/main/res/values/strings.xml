@@ -108,4 +108,6 @@
     <string name="ocr_preview_image">OCR Preview Image</string>
     <string name="session_deleted">Session deleted</string>
     <string name="new_session_started">New session started</string>
+    <string name="need_internet_vi">Cần internet để sửa lỗi chính tả</string>
+    <string name="need_internet_en">Internet is required for spell check</string>
 </resources>

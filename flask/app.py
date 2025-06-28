@@ -285,6 +285,26 @@ def delete_history_session():
         if cur:
             cur.close()
 
+@app.route('/add_history', methods=['POST'])
+def add_history():
+    user_id = request.form.get('user_id')
+    recognized_text = request.form.get('recognized_text')
+    file = request.files.get('image')
+    if not user_id or not recognized_text or not file:
+        return jsonify({'error': 'Missing data'}), 400
+
+    filename = secure_filename(f'{user_id}_{file.filename}')
+    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+    file.save(filepath)
+
+    cur = mysql.connection.cursor()
+    cur.execute("INSERT INTO images (user_id, image_path) VALUES (%s, %s)", (user_id, filepath))
+    image_id = cur.lastrowid
+    cur.execute("INSERT INTO results (image_id, recognized_text) VALUES (%s, %s)", (image_id, recognized_text))
+    mysql.connection.commit()
+    cur.close()
+    return jsonify({'message': 'History saved successfully'}), 200
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Run Flask app on a specified port')
     parser.add_argument('--port', type=int, default=5000, help='Port to run the Flask app on')

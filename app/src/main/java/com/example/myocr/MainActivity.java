@@ -186,7 +186,7 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
         // Using this will lead to incorrect results.
         // ACTION REQUIRED: You MUST find and replace the string below with the correct 126-character
         // vocabulary that was used to train your specific .onnx model for it to work correctly.
-        String englishChars = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~ ";
+        String englishChars = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~°£€¥¢฿àâéèêëîïôùûüçÀÂÉÈÊËÎÏÔÙÛÜÇ";
         englishVocab = new Vocab(englishChars);
 
         // Đọc ngôn ngữ đã lưu (nếu có)
@@ -226,7 +226,7 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
 
         // Setup for the OCR results RecyclerView
         ocrResultRecyclerView = findViewById(R.id.ocrResultRecyclerView);
-        ocrResultAdapter = new OcrResultAdapter(this, ocrResultList);
+        ocrResultAdapter = new OcrResultAdapter(this, ocrResultList, radioEnglish.isChecked());
         ocrResultRecyclerView.setLayoutManager(new LinearLayoutManager(this));
         ocrResultRecyclerView.setAdapter(ocrResultAdapter);
 
@@ -316,6 +316,11 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
                 getSharedPreferences("settings", MODE_PRIVATE).edit().putString("lang", newLang).apply();
                 setLocale(newLang);
                 recreate();
+            }
+            // Cập nhật adapter khi đổi ngôn ngữ
+            if (ocrResultAdapter != null) {
+                ocrResultAdapter = new OcrResultAdapter(this, ocrResultList, "en".equals(newLang));
+                ocrResultRecyclerView.setAdapter(ocrResultAdapter);
             }
         });
 
@@ -466,8 +471,8 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
         for (Uri uri : imageUris) {
             ocrResultList.add(new OcrResult(uri, true));
         }
-        ocrResultAdapter.notifyDataSetChanged();
-        
+        ocrResultAdapter = new OcrResultAdapter(this, ocrResultList, radioEnglish.isChecked());
+        ocrResultRecyclerView.setAdapter(ocrResultAdapter);
         // Get the language choice from UI thread here, before starting background processing
         final String selectedLang = radioVietnamese.isChecked() ? "vi" : "en";
 
@@ -597,14 +602,6 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
         Utils.bitmapToMat(previewBitmap, previewMat);
 
         for (Block block : blocks) {
-            // Draw block bounding box in RED
-            RotatedRect blockBox = block.getGeometry();
-            Point[] blockVertices = new Point[4];
-            blockBox.points(blockVertices);
-            MatOfPoint blockPoints = new MatOfPoint(blockVertices);
-            Imgproc.polylines(previewMat, Collections.singletonList(blockPoints), true, new Scalar(255, 0, 0), 3); // Red for blocks
-            blockPoints.release();
-
             // Draw lines in GREEN
             for(Line line : block.getLines()){
                 RotatedRect lineBox = line.getGeometry();
@@ -1137,6 +1134,51 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
             result.setProcessing(isProcessing);
             result.setError(null); // Clear previous errors
             ocrResultAdapter.notifyItemChanged(position);
+
+            // Sau khi OCR xong (isProcessing==false và page!=null), gửi lên backend
+            if (!isProcessing && page != null && userId > 0) {
+                String recognizedText = page.getContent();
+                Uri imageUri = result.getImageUri();
+                uploadOcrResultToBackend(userId, imageUri, recognizedText);
+            }
+        }
+    }
+
+    // Hàm upload kết quả OCR lên backend
+    private void uploadOcrResultToBackend(int userId, Uri imageUri, String recognizedText) {
+        try {
+            InputStream inputStream = getContentResolver().openInputStream(imageUri);
+            byte[] imageBytes = getBytes(inputStream);
+            inputStream.close();
+
+            OkHttpClient client = new OkHttpClient();
+            RequestBody requestBody = new MultipartBody.Builder()
+                    .setType(MultipartBody.FORM)
+                    .addFormDataPart("user_id", String.valueOf(userId))
+                    .addFormDataPart("recognized_text", recognizedText)
+                    .addFormDataPart("image", "image.jpg",
+                            RequestBody.create(imageBytes, MediaType.parse("image/jpeg")))
+                    .build();
+
+            Request request = new Request.Builder()
+                    .url(BASE_URL + "/add_history")
+                    .post(requestBody)
+                    .build();
+
+            new Thread(() -> {
+                try (Response response = client.newCall(request).execute()) {
+                    if (!response.isSuccessful()) {
+                        Log.e("UploadHistory", "Failed: " + response.message());
+                    } else {
+                        Log.d("UploadHistory", "Success: " + response.body().string());
+                    }
+                } catch (Exception e) {
+                    Log.e("UploadHistory", "Exception: " + e.getMessage());
+                }
+            }).start();
+
+        } catch (Exception e) {
+            Log.e("UploadHistory", "Exception: " + e.getMessage());
         }
     }
 
@@ -1684,62 +1726,13 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
      * @return A list of Block objects.
      */
     private List<Block> resolveBlocks(List<Line> lines) {
-        if (lines == null || lines.size() <= 1) {
-            // If there's 0 or 1 line, we can consider it a single block.
-            List<Block> singleBlockList = new ArrayList<>();
-            if (lines != null && !lines.isEmpty()) {
-                RotatedRect blockGeo = getEnclosingLineBox(lines.stream().map(line -> new WordBox(line.getGeometry(), 0)).collect(Collectors.toList()));
-                singleBlockList.add(new Block(lines, blockGeo));
-            }
-            return singleBlockList;
+        List<Block> blocks = new ArrayList<>();
+        for (Line line : lines) {
+            // Mỗi block chỉ chứa 1 line, geometry là geometry của line
+            blocks.add(new Block(Collections.singletonList(line), line.getGeometry()));
         }
-
-        // 1. Prepare the feature data for clustering.
-        double[][] features = new double[lines.size()][2];
-        for (int i = 0; i < lines.size(); i++) {
-            Rect lineRect = lines.get(i).getGeometry().boundingRect();
-            features[i][0] = lineRect.y + lineRect.height / 2.0; // Center Y is the primary feature
-            features[i][1] = lineRect.x;                         // Start X is the secondary feature
-        }
-
-        // 2. Perform hierarchical clustering.
-        WardLinkage linkage = WardLinkage.of(features);
-        HierarchicalClustering hclust = HierarchicalClustering.fit(linkage);
-
-        // 3. Partition the dendrogram into flat clusters (blocks).
-        // The distance threshold needs to be tuned. A higher value results in fewer, larger blocks.
-        List<Double> heights = lines.stream().map(line -> line.getGeometry().size.height).sorted().collect(Collectors.toList());
-        double medianHeight = heights.get(heights.size() / 2);
-        // The threshold is a critical parameter. Let's use 1.5x the median line height as a starting point.
-        int[] clusters = hclust.partition(medianHeight * 1.5);
-
-        // 4. Group lines into blocks based on the clustering result.
-        Map<Integer, List<Line>> blockMap = new HashMap<>();
-        for (int i = 0; i < clusters.length; i++) {
-            blockMap.computeIfAbsent(clusters[i], k -> new ArrayList<>()).add(lines.get(i));
-        }
-
-        // 5. Create Block objects from the map.
-        List<Block> resolvedBlocks = new ArrayList<>();
-        for (List<Line> blockLines : blockMap.values()) {
-            if (!blockLines.isEmpty()) {
-                // To get the geometry of the block, we use the helper function
-                // that gets the enclosing box for a list of words.
-                RotatedRect blockGeometry = getEnclosingLineBox(
-                        blockLines.stream()
-                                .map(line -> new WordBox(line.getGeometry(), 0)) // Adapt Line to WordBox for the helper
-                                .collect(Collectors.toList())
-                );
-                resolvedBlocks.add(new Block(blockLines, blockGeometry));
-            }
-        }
-
-        // Sort blocks from top to bottom
-        resolvedBlocks.sort(Comparator.comparingDouble(b -> b.getGeometry().center.y));
-
-        return resolvedBlocks;
+        return blocks;
     }
-
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);

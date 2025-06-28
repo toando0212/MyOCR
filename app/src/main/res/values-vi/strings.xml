@@ -52,4 +52,6 @@
     <string name="ocr_stopped_message">Quá trình OCR đã bị người dùng dừng lại.</string>
     <string name="long_press_to_delete">Nhấn giữ vào ảnh để xoá</string>
     <string name="toast_corner_suggestion">Để có kết quả tốt nhất, vui lòng đảm bảo ảnh chụp có đủ 4 góc của tài liệu.</string>
+    <string name="need_internet_vi">Cần internet để sửa lỗi chính tả</string>
+    <string name="need_internet_en">Internet is required for spell check</string>
 </resources>

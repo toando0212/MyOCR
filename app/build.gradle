@@ -30,6 +30,11 @@ android {
     buildFeatures {
         viewBinding true
     }
+    packaging {
+        resources {
+            excludes += ['META-INF/INDEX.LIST', 'META-INF/DEPENDENCIES']
+        }
+    }
 }
 
 dependencies {
@@ -54,8 +59,13 @@ dependencies {
     implementation project(':sdk')
     implementation 'com.github.chrisbanes:PhotoView:2.3.0'
     implementation 'com.google.code.gson:gson:2.8.8'
-    implementation 'com.github.haifengl:smile-core:3.0.1'
+    implementation('com.github.haifengl:smile-core:3.0.1') {
+        exclude group: 'com.intellij', module: 'annotations'
+    }
     implementation 'org.bytedeco:javacpp:1.5.11'
     implementation 'org.bytedeco:openblas:0.3.28-1.5.11:android-arm64'
     implementation 'org.bytedeco:openblas:0.3.28-1.5.11:android-x86_64'
+    implementation('org.languagetool:language-en:5.9') {
+        exclude group: 'com.intellij', module: 'annotations'
+    }
 }

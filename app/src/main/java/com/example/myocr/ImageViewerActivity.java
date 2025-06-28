@@ -471,26 +471,8 @@ public class ImageViewerActivity extends AppCompatActivity implements ThumbnailA
     }
 
     private Bitmap createPreviewBitmap(Bitmap bitmap) {
-        // BUG FIX: Add a check to prevent re-processing a binary image.
-        if (isGrayscale(bitmap)) {
-            return bitmap.copy(Bitmap.Config.ARGB_8888, false); // Already processed, just return
-        }
-
-        Mat srcMat = new Mat();
-        Utils.bitmapToMat(bitmap, srcMat);
-        Mat grayMat = new Mat();
-        Imgproc.cvtColor(srcMat, grayMat, Imgproc.COLOR_RGB2GRAY);
-        Mat blurredMat = new Mat();
-        Imgproc.GaussianBlur(grayMat, blurredMat, new Size(5, 5), 0);
-        Mat threshMat = new Mat();
-        Imgproc.adaptiveThreshold(blurredMat, threshMat, 255, Imgproc.ADAPTIVE_THRESH_MEAN_C, Imgproc.THRESH_BINARY, 21, 5);
-        Bitmap preview = Bitmap.createBitmap(threshMat.cols(), threshMat.rows(), Bitmap.Config.ARGB_8888);
-        Utils.matToBitmap(threshMat, preview);
-        srcMat.release();
-        grayMat.release();
-        blurredMat.release();
-        threshMat.release();
-        return preview;
+        // Trả về bản sao màu của ảnh gốc, không chuyển grayscale, không binarize
+        return bitmap.copy(Bitmap.Config.ARGB_8888, false);
     }
 
     private boolean isGrayscale(Bitmap bitmap) {
@@ -746,31 +728,8 @@ public class ImageViewerActivity extends AppCompatActivity implements ThumbnailA
     }
 
     private Bitmap createFinalProcessedBitmap(Bitmap colorBitmap) {
-        // This function chains all preprocessing steps as requested.
-        Mat colorMat = new Mat();
-        Utils.bitmapToMat(colorBitmap, colorMat);
-
-        // 1. Grayscale
-        Mat grayMat = new Mat();
-        Imgproc.cvtColor(colorMat, grayMat, Imgproc.COLOR_RGB2GRAY);
-        colorMat.release();
-
-        // 2. Binarize (Adaptive Threshold)
-        Mat threshMat = new Mat();
-        Imgproc.adaptiveThreshold(grayMat, threshMat, 255,
-                Imgproc.ADAPTIVE_THRESH_GAUSSIAN_C,
-                Imgproc.THRESH_BINARY, 21, 5);
-        grayMat.release();
-
-        // 3. Remove Horizontal Lines
-        Mat noLinesMat = removeHorizontalLines(threshMat);
-        threshMat.release();
-
-        Bitmap finalBitmap = Bitmap.createBitmap(noLinesMat.cols(), noLinesMat.rows(), Bitmap.Config.ARGB_8888);
-        Utils.matToBitmap(noLinesMat, finalBitmap);
-        noLinesMat.release();
-
-        return finalBitmap;
+        // Trả về bản sao màu của ảnh gốc, không chuyển grayscale, không binarize
+        return colorBitmap.copy(Bitmap.Config.ARGB_8888, false);
     }
 
     private Mat removeHorizontalLines(Mat binaryMat) {

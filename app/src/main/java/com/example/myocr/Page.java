@@ -27,6 +27,16 @@ public class Page {
         this.content = blocks.stream().map(Block::getContent).collect(Collectors.joining("\n\n"));
     }
 
+    // Constructor mới cho phép truyền content tuỳ ý
+    public Page(List<Block> blocks, int pageIndex, int width, int height, Bitmap previewImage, String content) {
+        this.blocks = blocks;
+        this.pageIndex = pageIndex;
+        this.width = width;
+        this.height = height;
+        this.previewImage = previewImage;
+        this.content = content;
+    }
+
     public List<Block> getBlocks() {
         return blocks;
     }

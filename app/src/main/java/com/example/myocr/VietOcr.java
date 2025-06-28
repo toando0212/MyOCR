@@ -26,7 +26,7 @@ import java.util.Arrays;
 
 public class VietOcr {
     // --- Vocabulary and Constants ---
-    private static final String VOCAB = "aAàÀảẢãÃáÁạẠăĂằẰẳẲẵẴắẮặẶâÂầẦẩẨẫẪấẤậẬbBcCdDđĐeEèÈẻẺẽẼéÉẹẸêÊềỀểỂễỄếẾệỆfFgGhHiIìÌỉỈĩĨíÍịỊjJkKlLmMnNoOòÒỏỎõÕóÓọỌôÔồỒổỔỗỖốỐộỘơƠờỜởỞỡỠớỚợỢpPqQrRsStTuUùÙủỦũŨúÚụỤưƯừỪửỬữỮứỨựỰvVwWxXyYỳỲỷỶỹỸýÝỵỴzZ0123456789!\"#$%&''()*+,-./:;<=>?@[\\]^_`{|}~";
+    private static final String VOCAB = "aAàÀảẢãÃáÁạẠăĂằẰẳẲẵẴắẮặẶâÂầẦẩẨẫẪấẤậẬbBcCdDđĐeEèÈẻẺẽẼéÉẹẸêÊềỀểỂễỄếẾệỆfFgGhHiIìÌỉỈĩĨíÍịỊjJkKlLmMnNoOòÒỏỎõÕóÓọỌôÔồỒổỔỗỖốỐộỘơƠờỜởỞỡỠớỚợỢpPqQrRsStTuUùÙủỦũŨúÚụỤưƯừỪửỬữỮứỨựỰvVwWxXyYỳỲỷỶỹỸýÝỵỴzZ0123456789!\\\"#$%&''()*+,-./:;<=>?@[\\\\]^_`{|}~";
     private final Vocab vocab;
     private final OrtEnvironment env;
     private final OrtSession crnnSession;
@@ -35,7 +35,7 @@ public class VietOcr {
         vocab = new Vocab(VOCAB);
         env = OrtEnvironment.getEnvironment();
         OrtSession.SessionOptions opts = new OrtSession.SessionOptions();
-        crnnSession = env.createSession(assetFilePath(context, "best_checkpointprinted_2.onnx"), opts);
+        crnnSession = env.createSession(assetFilePath(context, "best_checkpoint_printed3.onnx"), opts);
     }
 
     public void close() throws OrtException {

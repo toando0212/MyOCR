@@ -36,4 +36,21 @@
         android:visibility="gone"
         android:contentDescription="@string/ocr_preview_image" />
 
+    <Button
+        android:id="@+id/btnSpellCheck"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Sửa lỗi chính tả"
+        android:visibility="gone"/>
+
+    <TextView
+        android:id="@+id/tvSpellLang"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Vietnamese"
+        android:textSize="12sp"
+        android:textColor="@android:color/darker_gray"
+        android:visibility="gone"
+        android:layout_marginTop="2dp"/>
+
 </LinearLayout> 
