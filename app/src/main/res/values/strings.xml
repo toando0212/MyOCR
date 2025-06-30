@@ -110,4 +110,10 @@
     <string name="new_session_started">New session started</string>
     <string name="need_internet_vi">Cần internet để sửa lỗi chính tả</string>
     <string name="need_internet_en">Internet is required for spell check</string>
+    <string name="spell_check_result">Spell Check Result</string>
+    <string name="undo">Undo</string>
+    <string name="spell_check_applied">Spell check applied!</string>
+    <string name="undo_successful">Undo successful!</string>
+    <string name="replacement_chosen">Replacement chosen for this word </string>
+    <string name="no_suggestions_available">No suggestions available for this word.</string>
 </resources>

@@ -40,7 +40,7 @@ class DBNetDetector:
     def preprocess(self, pil_img):
         img = pil_img.convert('RGB')
         w, h = img.size
-        target_size = 512
+        target_size = 1024 # Changed to match DBNet input size
         ratio = w / h
         if ratio > 1:
             resized_w = target_size
@@ -56,8 +56,9 @@ class DBNetDetector:
         new_img = Image.new('RGB', (target_size, target_size), (0,0,0))
         new_img.paste(img_resized, (pad_left, pad_top))
         img_np = np.array(new_img).astype(np.float32) / 255.0
-        mean = np.array([0.485, 0.456, 0.406])
-        std = np.array([0.229, 0.224, 0.225])
+        # Updated mean and std for doctr DBNet models
+        mean = np.array([0.798, 0.785, 0.772])
+        std = np.array([0.264, 0.2749, 0.287])
         img_np = (img_np - mean) / std
         img_np = img_np.transpose(2, 0, 1)
         img_np = np.expand_dims(img_np, 0)
@@ -84,12 +85,15 @@ class DBNetDetector:
         return float(np.mean(prob_map[mask == 1]))
 
     def postprocess(self, pred, orig_size, resized_w, resized_h, pad_left, pad_top):
-        pred = pred[0, 0]
+        pred = pred[0, 0] # Output is 1 channel
         # Apply sigmoid
         prob_map = 1 / (1 + np.exp(-pred))
         # Binarize
         mask = prob_map > self.bin_thresh
-        mask = mask.astype(np.uint8) * 255
+        # Apply morphological opening (erosion then dilation) like doctr DBNet
+        opening_kernel = np.ones((3, 3), dtype=np.uint8)
+        mask = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_OPEN, opening_kernel) * 255
+        
         contours, _ = cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
         boxes = []
         h, w = prob_map.shape
@@ -108,6 +112,11 @@ class DBNetDetector:
             rect = cv2.minAreaRect(cnt_expanded)
             box = cv2.boxPoints(rect)
             box = np.array(box)
+            # Kiểm soát kích thước box nhỏ (giống doctr)
+            width = np.linalg.norm(box[0] - box[1])
+            height = np.linalg.norm(box[1] - box[2])
+            if width < 2 or height < 2:
+                continue
             # Calculate confidence score giống Doctr
             score = self.box_score(prob_map, cnt_expanded)
             if score < self.box_thresh:
@@ -137,7 +146,7 @@ def post_process_text(text: str) -> str:
 # --- PyTorch CRNN Recognizer ---
 crnn_model = crnn_mobilenet_v3_large(pretrained=False, vocab=VOCAB)
 # crnn_model = crnn_model.cuda()
-checkpoint = torch.load("best_checkpoint_printed3.pth", map_location="cpu")
+checkpoint = torch.load("best_checkpoint_(1).pth", map_location="cpu")
 crnn_model.load_state_dict(checkpoint["model_state_dict"])
 crnn_model.eval()
 
@@ -156,7 +165,7 @@ def recognize_pytorch(img_pil):
     return text
 
 # --- Instantiate models ---
-dbnet_detector = DBNetDetector("db_mobilenet_v3_large.onnx")
+dbnet_detector = DBNetDetector("db_mobilenet_v3_large.onnx") # Updated model name
 
 # --- Main pipeline ---
 def ocr_pipeline(img):

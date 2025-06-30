@@ -40,6 +40,12 @@ import java.util.HashSet;
 import android.app.AlertDialog;
 import android.widget.ScrollView;
 import android.widget.EditText;
+import android.text.SpannableString;
+import android.text.Spanned;
+import android.text.style.ForegroundColorSpan;
+import android.text.style.ClickableSpan;
+import android.view.MotionEvent;
+import android.text.method.LinkMovementMethod;
 
 public class OcrResultAdapter extends RecyclerView.Adapter<OcrResultAdapter.ViewHolder> {
 
@@ -48,11 +54,13 @@ public class OcrResultAdapter extends RecyclerView.Adapter<OcrResultAdapter.View
     private boolean isEnglishMode = false;
     private static HashSet<String> vietnameseDict;
     private static boolean dictLoaded = false;
+    private final OkHttpClient client;
 
-    public OcrResultAdapter(Context context, List<OcrResult> ocrResultList, boolean isEnglishMode) {
+    public OcrResultAdapter(Context context, List<OcrResult> ocrResultList, boolean isEnglishMode, OkHttpClient client) {
         this.context = context;
         this.ocrResultList = ocrResultList;
         this.isEnglishMode = isEnglishMode;
+        this.client = client;
     }
 
     public void setOcrResults(List<OcrResult> ocrResults) {
@@ -136,59 +144,70 @@ public class OcrResultAdapter extends RecyclerView.Adapter<OcrResultAdapter.View
                 }
                 btnSpellCheck.setOnClickListener(v -> {
                     btnSpellCheck.setEnabled(false);
-                    OkHttpClient client = new OkHttpClient();
                     String originalText = result.getText();
-                    RequestBody formBody = new FormBody.Builder()
-                            .add("language", "en-US")
-                            .add("text", originalText)
-                            .build();
+                    JSONObject json = new JSONObject();
+                    try {
+                        json.put("text", originalText);
+                        json.put("language", "en_US");
+                    } catch (Exception e) {
+                        btnSpellCheck.setEnabled(true);
+                        Toast.makeText(context, "Lỗi tạo request: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                        return;
+                    }
+                    String spellcheckUrl = MainActivity.BASE_URL + "/spellcheck";
+                    RequestBody body = RequestBody.create(json.toString(), MediaType.get("application/json; charset=utf-8"));
                     Request request = new Request.Builder()
-                            .url("https://api.languagetool.org/v2/check")
-                            .post(formBody)
+                            .url(spellcheckUrl)
+                            .post(body)
                             .build();
                     client.newCall(request).enqueue(new Callback() {
                         @Override
                         public void onFailure(Call call, IOException e) {
+                            Log.e("SpellCheckDebug", "onFailure: " + e.getMessage());
                             ((android.app.Activity) context).runOnUiThread(() -> {
-                                String msg = Locale.getDefault().getLanguage().equals("vi") ? "Cần internet để sửa lỗi chính tả" : "Internet is required for spell check";
-                                Toast.makeText(context, msg, Toast.LENGTH_LONG).show();
+                                Toast.makeText(context, "Cần internet để sửa lỗi chính tả", Toast.LENGTH_LONG).show();
                                 btnSpellCheck.setEnabled(true);
                             });
                         }
                         @Override
                         public void onResponse(Call call, Response response) throws IOException {
-                            if (!response.isSuccessful()) {
-                                ((android.app.Activity) context).runOnUiThread(() -> {
-                                    Toast.makeText(context, "Lỗi khi sửa chính tả: " + response.message(), Toast.LENGTH_LONG).show();
-                                    btnSpellCheck.setEnabled(true);
-                                });
-                                return;
-                            }
-                            String responseBody = response.body().string();
                             try {
-                                JSONObject json = new JSONObject(responseBody);
-                                JSONArray matches = json.getJSONArray("matches");
-                                StringBuilder corrected = new StringBuilder(originalText);
-                                int offset = 0;
-                                for (int i = 0; i < matches.length(); i++) {
-                                    JSONObject match = matches.getJSONObject(i);
-                                    JSONArray replacements = match.getJSONArray("replacements");
-                                    if (replacements.length() > 0) {
-                                        String replacement = replacements.getJSONObject(0).getString("value");
-                                        int fromPos = match.getInt("offset") + offset;
-                                        int toPos = fromPos + match.getInt("length");
-                                        corrected.replace(fromPos, toPos, replacement);
-                                        offset += replacement.length() - match.getInt("length");
-                                    }
+                                Log.d("SpellCheckDebug", "onResponse START. Successful: " + response.isSuccessful());
+
+                                if (!response.isSuccessful()) {
+                                    Log.e("SpellCheckDebug", "Response not successful. Code: " + response.code());
+                                    ((android.app.Activity) context).runOnUiThread(() -> {
+                                        Toast.makeText(context, "Lỗi server: " + response.message(), Toast.LENGTH_LONG).show();
+                                        btnSpellCheck.setEnabled(true);
+                                    });
+                                    return;
                                 }
-                                String fixedText = corrected.toString();
-                                // Hiện dialog xác nhận
+
+                                final String responseBody = response.body().string();
+                                Log.d("SpellCheckDebug", "Successfully read response body. Length: " + responseBody.length());
+
+                                final JSONObject json = new JSONObject(responseBody);
+                                final String fixedText = json.optString("corrected_text", originalText);
+                                final JSONArray typosArray = json.optJSONArray("typos");
+                                Log.d("SpellCheckDebug", "Parsed JSON, got fixedText. Length: " + fixedText.length());
+
                                 ((android.app.Activity) context).runOnUiThread(() -> {
-                                    showSpellCheckDialog(originalText, fixedText, result, position, btnSpellCheck);
+                                    try {
+                                        Log.d("SpellCheckDebug", "Inside runOnUiThread. Preparing to show dialog.");
+                                        Toast.makeText(context, "Đã nhận kết quả, đang hiển thị...", Toast.LENGTH_SHORT).show();
+                                        showSpellCheckDialogWithTypos(originalText, fixedText, typosArray, result, position, btnSpellCheck);
+                                        Log.d("SpellCheckDebug", "showSpellCheckDialog call completed.");
+                                    } catch (Exception e) {
+                                        Log.e("SpellCheckDebug", "ERROR inside runOnUiThread (showing dialog)", e);
+                                        Toast.makeText(context, "Lỗi hiển thị kết quả: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                                        btnSpellCheck.setEnabled(true);
+                                    }
                                 });
+
                             } catch (Exception e) {
+                                Log.e("SpellCheckDebug", "FATAL ERROR in onResponse background task", e);
                                 ((android.app.Activity) context).runOnUiThread(() -> {
-                                    Toast.makeText(context, "Lỗi khi phân tích kết quả sửa chính tả: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                                    Toast.makeText(context, "Lỗi xử lý phản hồi: " + e.getMessage(), Toast.LENGTH_LONG).show();
                                     btnSpellCheck.setEnabled(true);
                                 });
                             }
@@ -202,72 +221,74 @@ public class OcrResultAdapter extends RecyclerView.Adapter<OcrResultAdapter.View
                 }
                 btnSpellCheck.setOnClickListener(v -> {
                     btnSpellCheck.setEnabled(false);
-                    // Load dictionary nếu chưa load
-                    if (!dictLoaded) {
-                        vietnameseDict = new HashSet<>();
-                        try {
-                            AssetManager am = context.getAssets();
-                            InputStream is = am.open("Viet74K.txt");
-                            BufferedReader reader = new BufferedReader(new InputStreamReader(is, "UTF-8"));
-                            String line;
-                            while ((line = reader.readLine()) != null) {
-                                vietnameseDict.add(line.trim().toLowerCase());
-                            }
-                            reader.close();
-                            is.close();
-                            dictLoaded = true;
-                        } catch (Exception e) {
+                    String originalText = result.getText();
+                    JSONObject json = new JSONObject();
+                    try {
+                        json.put("text", originalText);
+                        json.put("language", "vi_VN");
+                    } catch (Exception e) {
+                        btnSpellCheck.setEnabled(true);
+                        Toast.makeText(context, "Lỗi tạo request: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                        return;
+                    }
+                    String spellcheckUrl = MainActivity.BASE_URL + "/spellcheck";
+                    RequestBody body = RequestBody.create(json.toString(), MediaType.get("application/json; charset=utf-8"));
+                    Request request = new Request.Builder()
+                            .url(spellcheckUrl)
+                            .post(body)
+                            .build();
+                    client.newCall(request).enqueue(new Callback() {
+                        @Override
+                        public void onFailure(Call call, IOException e) {
+                            Log.e("SpellCheckDebug", "onFailure: " + e.getMessage());
                             ((android.app.Activity) context).runOnUiThread(() -> {
-                                Toast.makeText(context, "Lỗi tải từ điển: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                                Toast.makeText(context, "Cần internet để sửa lỗi chính tả", Toast.LENGTH_LONG).show();
                                 btnSpellCheck.setEnabled(true);
                             });
-                            return;
                         }
-                    }
-                    // Giữ nguyên line breaks khi sửa
-                    String originalText = result.getText();
-                    String[] lines = originalText.split("\\r?\\n");
-                    StringBuilder checked = new StringBuilder();
-                    for (int l = 0; l < lines.length; l++) {
-                        String line = lines[l];
-                        String[] words = line.split("\\s+");
-                        for (String word : words) {
-                            String cleanWord = word.replaceAll("[^\\p{L}]", "").toLowerCase();
-                            if (cleanWord.isEmpty()) {
-                                checked.append(word).append(" ");
-                                continue;
-                            }
-                            if (vietnameseDict.contains(cleanWord)) {
-                                checked.append(word).append(" ");
-                            } else {
-                                // Tìm từ gần đúng nhất trong từ điển
-                                String best = null;
-                                int minDist = Integer.MAX_VALUE;
-                                for (String dictWord : vietnameseDict) {
-                                    int dist = levenshtein(cleanWord, dictWord);
-                                    if (dist < minDist) {
-                                        minDist = dist;
-                                        best = dictWord;
-                                        if (minDist == 1) break;
-                                    }
+                        @Override
+                        public void onResponse(Call call, Response response) throws IOException {
+                            try {
+                                Log.d("SpellCheckDebug", "onResponse START. Successful: " + response.isSuccessful());
+
+                                if (!response.isSuccessful()) {
+                                    Log.e("SpellCheckDebug", "Response not successful. Code: " + response.code());
+                                    ((android.app.Activity) context).runOnUiThread(() -> {
+                                        Toast.makeText(context, "Lỗi server: " + response.message(), Toast.LENGTH_LONG).show();
+                                        btnSpellCheck.setEnabled(true);
+                                    });
+                                    return;
                                 }
-                                if (best != null && minDist <= 2) {
-                                    String suggest = best;
-                                    if (Character.isUpperCase(word.charAt(0))) {
-                                        suggest = Character.toUpperCase(best.charAt(0)) + best.substring(1);
+
+                                final String responseBody = response.body().string();
+                                Log.d("SpellCheckDebug", "Successfully read response body. Length: " + responseBody.length());
+
+                                final JSONObject json = new JSONObject(responseBody);
+                                final String fixedText = json.optString("corrected_text", originalText);
+                                final JSONArray typosArray = json.optJSONArray("typos");
+                                Log.d("SpellCheckDebug", "Parsed JSON, got fixedText. Length: " + fixedText.length());
+
+                                ((android.app.Activity) context).runOnUiThread(() -> {
+                                    try {
+                                        Log.d("SpellCheckDebug", "Inside runOnUiThread. Preparing to show dialog.");
+                                        Toast.makeText(context, "Đã nhận kết quả, đang hiển thị...", Toast.LENGTH_SHORT).show();
+                                        showSpellCheckDialogWithTypos(originalText, fixedText, typosArray, result, position, btnSpellCheck);
+                                        Log.d("SpellCheckDebug", "showSpellCheckDialog call completed.");
+                                    } catch (Exception e) {
+                                        Log.e("SpellCheckDebug", "ERROR inside runOnUiThread (showing dialog)", e);
+                                        Toast.makeText(context, "Lỗi hiển thị kết quả: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                                        btnSpellCheck.setEnabled(true);
                                     }
-                                    checked.append(suggest).append(" ");
-                                } else {
-                                    checked.append(word).append(" ");
-                                }
+                                });
+
+                            } catch (Exception e) {
+                                Log.e("SpellCheckDebug", "FATAL ERROR in onResponse background task", e);
+                                ((android.app.Activity) context).runOnUiThread(() -> {
+                                    Toast.makeText(context, "Lỗi xử lý phản hồi: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                                    btnSpellCheck.setEnabled(true);
+                                });
                             }
                         }
-                        if (l < lines.length - 1) checked.append("\n");
-                    }
-                    String fixedText = checked.toString().trim();
-                    // Hiện dialog xác nhận
-                    ((android.app.Activity) context).runOnUiThread(() -> {
-                        showSpellCheckDialog(originalText, fixedText, result, position, btnSpellCheck);
                     });
                 });
             }
@@ -314,20 +335,98 @@ public class OcrResultAdapter extends RecyclerView.Adapter<OcrResultAdapter.View
         return dp[a.length()][b.length()];
     }
 
-    // Thêm hàm showSpellCheckDialog
-    private void showSpellCheckDialog(String originalText, String fixedText, OcrResult result, int position, Button btnSpellCheck) {
+    private void showSpellCheckDialogWithTypos(String originalText, String fixedText, JSONArray typosArray, OcrResult result, int position, Button btnSpellCheck) {
+        Log.d("SpellCheckDebug", "showSpellCheckDialogWithTypos START");
         AlertDialog.Builder builder = new AlertDialog.Builder(context);
-        builder.setTitle("Kết quả sửa lỗi chính tả");
+        String title = context.getString(R.string.spell_check_result);
+        String btnConfirm = context.getString(R.string.confirm);
+        String btnCancel = context.getString(R.string.cancel);
+        String btnUndo = context.getString(R.string.undo);
+        String toastApplied = context.getString(R.string.spell_check_applied);
+        String toastUndo = context.getString(R.string.undo_successful);
+        builder.setTitle(title);
         ScrollView scrollView = new ScrollView(context);
-        EditText editText = new EditText(context);
-        editText.setText(fixedText);
-        editText.setMinLines(6);
-        editText.setMaxLines(20);
-        editText.setTextIsSelectable(true);
-        editText.setFocusable(false);
-        scrollView.addView(editText);
+        TextView textView = new TextView(context);
+        textView.setTextIsSelectable(true);
+
+        // Lưu trạng thái trước đó để Undo
+        final String[] prevText = {originalText};
+        final JSONArray[] prevTypos = {null};
+        try {
+            prevTypos[0] = typosArray != null ? new JSONArray(typosArray.toString()) : new JSONArray();
+        } catch (org.json.JSONException e) {
+            e.printStackTrace();
+            prevTypos[0] = new JSONArray();
+        }
+
+        // Split the original text into lines to preserve structure
+        String[] originalLines = originalText.split("\n");
+        StringBuilder displayText = new StringBuilder();
+        int charIndex = 0;
+        for (String line : originalLines) {
+            displayText.append(line);
+            charIndex += line.length();
+            if (charIndex < originalText.length()) {
+                displayText.append("\n");
+                charIndex++;
+            }
+        }
+
+        SpannableString spannable = new SpannableString(displayText.toString());
+        if (typosArray != null) {
+            for (int i = 0; i < typosArray.length(); i++) {
+                try {
+                    JSONObject typo = typosArray.getJSONObject(i);
+                    String word = typo.getString("word");
+                    int start = typo.getInt("start");
+                    int end = typo.getInt("end");
+                    JSONArray suggestions = typo.getJSONArray("suggestions");
+
+                    if (start >= 0 && end <= displayText.length()) {
+                        spannable.setSpan(new ForegroundColorSpan(android.graphics.Color.RED), start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                        final String[] suggestionList = new String[suggestions.length()];
+                        for (int k = 0; k < suggestions.length(); k++) {
+                            suggestionList[k] = suggestions.getString(k);
+                        }
+                        final String finalFixedText = displayText.toString();
+                        final int finalStart = start;
+                        final int finalEnd = end;
+                        final OcrResult finalResult = result;
+                        final int finalPosition = position;
+                        spannable.setSpan(new ClickableSpan() {
+                            @Override
+                            public void onClick(View widget) {
+                                // Lưu trạng thái trước khi sửa để Undo
+                                prevText[0] = textView.getText().toString();
+                                try {
+                                    prevTypos[0] = new JSONArray(typosArray.toString());
+                                } catch (org.json.JSONException e) {
+                                    e.printStackTrace();
+                                    prevTypos[0] = new JSONArray();
+                                }
+                                showSuggestionsDialog(word, suggestionList, finalFixedText, finalStart, finalEnd, finalResult, finalPosition, btnSpellCheck, prevText, prevTypos);
+                            }
+                        }, start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                    }
+                } catch (Exception e) {
+                    Log.e("SpellCheckDebug", "Error processing typo: " + e.getMessage());
+                }
+            }
+        }
+
+        textView.setText(spannable);
+        textView.setMovementMethod(LinkMovementMethod.getInstance());
+        textView.setOnTouchListener((v, event) -> {
+            if (event.getAction() == MotionEvent.ACTION_UP) {
+                textView.setFocusable(false);
+            }
+            return false;
+        });
+        textView.setMinLines(6);
+        textView.setMaxLines(20);
+        scrollView.addView(textView);
         builder.setView(scrollView);
-        builder.setPositiveButton("Xác nhận", (dialog, which) -> {
+        builder.setPositiveButton(btnConfirm, (dialog, which) -> {
             Page oldPage = result.getPage();
             if (oldPage == null) {
                 oldPage = new Page(
@@ -349,14 +448,129 @@ public class OcrResultAdapter extends RecyclerView.Adapter<OcrResultAdapter.View
             );
             result.setPage(newPage);
             notifyItemChanged(position);
-            Toast.makeText(context, "Đã áp dụng sửa lỗi chính tả!", Toast.LENGTH_SHORT).show();
+            Toast.makeText(context, toastApplied, Toast.LENGTH_SHORT).show();
             btnSpellCheck.setEnabled(true);
         });
-        builder.setNegativeButton("Hủy", (dialog, which) -> {
-            // Không thay đổi gì
+        builder.setNegativeButton(btnCancel, (dialog, which) -> {
             btnSpellCheck.setEnabled(true);
+        });
+        builder.setNeutralButton(btnUndo, (dialog, which) -> {
+            showSpellCheckDialogWithTypos(prevText[0], prevText[0], prevTypos[0], result, position, btnSpellCheck);
+            Toast.makeText(context, toastUndo, Toast.LENGTH_SHORT).show();
         });
         builder.setOnCancelListener(dialog -> btnSpellCheck.setEnabled(true));
         builder.show();
+    }
+
+    private void showSuggestionsDialog(String originalWord, String[] suggestions, String currentText, int start, int end, OcrResult result, int position, Button btnSpellCheck, String[] prevText, JSONArray[] prevTypos) {
+        String chooseReplacement = context.getString(R.string.replacement_chosen, originalWord);
+        AlertDialog.Builder builder = new AlertDialog.Builder(context);
+        builder.setTitle(chooseReplacement);
+        if (suggestions.length > 0) {
+            builder.setItems(suggestions, (dialog, which) -> {
+                String selectedSuggestion = suggestions[which];
+                StringBuilder newText = new StringBuilder(currentText);
+                newText.replace(start, end, selectedSuggestion);
+                Page oldPage = result.getPage();
+                if (oldPage == null) {
+                    oldPage = new Page(
+                        new java.util.ArrayList<>(),
+                        position,
+                        0,
+                        0,
+                        null,
+                        newText.toString()
+                    );
+                }
+                Page newPage = new Page(
+                    oldPage.getBlocks(),
+                    oldPage.getPageIndex(),
+                    oldPage.getWidth(),
+                    oldPage.getHeight(),
+                    oldPage.getPreviewImage(),
+                    newText.toString()
+                );
+                result.setPage(newPage);
+                notifyItemChanged(position);
+                Toast.makeText(context, "Replaced '" + originalWord + "' with '" + selectedSuggestion + "'", Toast.LENGTH_SHORT).show();
+                recheckSpelling(newText.toString(), result, position, btnSpellCheck, isEnglishMode);
+            });
+        } else {
+            builder.setMessage(context.getString(R.string.no_suggestions_available));
+            builder.setPositiveButton(context.getString(R.string.ok), null);
+        }
+        builder.show();
+    }
+
+    // Thêm phương thức để gọi lại API kiểm tra chính tả
+    private void recheckSpelling(String text, OcrResult result, int position, Button btnSpellCheck, boolean isEnglishMode) {
+        JSONObject json = new JSONObject();
+        try {
+            json.put("text", text);
+            json.put("language", isEnglishMode ? "en_US" : "vi_VN");
+        } catch (Exception e) {
+            Toast.makeText(context, "Lỗi tạo request: " + e.getMessage(), Toast.LENGTH_LONG).show();
+            btnSpellCheck.setEnabled(true);
+            return;
+        }
+        String spellcheckUrl = MainActivity.BASE_URL + "/spellcheck";
+        RequestBody body = RequestBody.create(json.toString(), MediaType.get("application/json; charset=utf-8"));
+        Request request = new Request.Builder()
+                .url(spellcheckUrl)
+                .post(body)
+                .build();
+        client.newCall(request).enqueue(new Callback() {
+            @Override
+            public void onFailure(Call call, IOException e) {
+                Log.e("SpellCheckDebug", "onFailure: " + e.getMessage());
+                ((android.app.Activity) context).runOnUiThread(() -> {
+                    Toast.makeText(context, "Cần internet để sửa lỗi chính tả", Toast.LENGTH_LONG).show();
+                    btnSpellCheck.setEnabled(true);
+                });
+            }
+            @Override
+            public void onResponse(Call call, Response response) throws IOException {
+                try {
+                    Log.d("SpellCheckDebug", "onResponse START. Successful: " + response.isSuccessful());
+
+                    if (!response.isSuccessful()) {
+                        Log.e("SpellCheckDebug", "Response not successful. Code: " + response.code());
+                        ((android.app.Activity) context).runOnUiThread(() -> {
+                            Toast.makeText(context, "Lỗi server: " + response.message(), Toast.LENGTH_LONG).show();
+                            btnSpellCheck.setEnabled(true);
+                        });
+                        return;
+                    }
+
+                    final String responseBody = response.body().string();
+                    Log.d("SpellCheckDebug", "Successfully read response body. Length: " + responseBody.length());
+
+                    final JSONObject json = new JSONObject(responseBody);
+                    final String fixedText = json.optString("corrected_text", text);
+                    final JSONArray typosArray = json.optJSONArray("typos");
+                    Log.d("SpellCheckDebug", "Parsed JSON, got fixedText. Length: " + fixedText.length());
+
+                    ((android.app.Activity) context).runOnUiThread(() -> {
+                        try {
+                            Log.d("SpellCheckDebug", "Inside runOnUiThread. Preparing to show dialog.");
+                            Toast.makeText(context, "Đã nhận kết quả, đang hiển thị...", Toast.LENGTH_SHORT).show();
+                            showSpellCheckDialogWithTypos(text, fixedText, typosArray, result, position, btnSpellCheck);
+                            Log.d("SpellCheckDebug", "showSpellCheckDialog call completed.");
+                        } catch (Exception e) {
+                            Log.e("SpellCheckDebug", "ERROR inside runOnUiThread (showing dialog)", e);
+                            Toast.makeText(context, "Lỗi hiển thị kết quả: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                            btnSpellCheck.setEnabled(true);
+                        }
+                    });
+
+                } catch (Exception e) {
+                    Log.e("SpellCheckDebug", "FATAL ERROR in onResponse background task", e);
+                    ((android.app.Activity) context).runOnUiThread(() -> {
+                        Toast.makeText(context, "Lỗi xử lý phản hồi: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                        btnSpellCheck.setEnabled(true);
+                    });
+                }
+            }
+        });
     }
 } 

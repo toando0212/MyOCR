@@ -41,7 +41,7 @@ public class LoginActivity extends AppCompatActivity {
             .writeTimeout(60, TimeUnit.SECONDS)
             .readTimeout(60, TimeUnit.SECONDS)
             .build();
-    private static final String BASE_URL = "https://7c2c-2405-4803-f801-12a0-1883-6ffe-89a4-5660.ngrok-free.app"; // IMPORTANT: Use your actual server URL
+    public static final String BASE_URL = "http://192.168.1.229:5000"; // IMPORTANT: Replace '192.168.x.x' with your actual server IP address
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {

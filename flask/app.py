@@ -1,20 +1,14 @@
-from flask import Flask, jsonify, request, send_file
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_mysqldb import MySQL
 import os
 from werkzeug.utils import secure_filename
-import cv2
-import numpy as np
 from werkzeug.security import generate_password_hash, check_password_hash
-from PIL import Image, ImageOps
-import io
 import base64
 import argparse
-
-# Import the OCR pipelines
-# These files now contain all the model loading and processing logic.
-from english_pipeline import ocr_pipeline as process_english
-from viet_ocr import ocr_pipeline as process_vietnamese
+import phunspell
+import re
+# from spellchecker import SpellChecker
 
 # Global constants
 app = Flask(__name__)
@@ -30,99 +24,25 @@ os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
 mysql = MySQL(app)
 
-# --- Model Loading is now handled within the imported pipeline files ---
-print("All models are being loaded by their respective pipeline modules...")
+# Khởi tạo phunspell cho tiếng Việt (chỉ khởi tạo 1 lần)
+try:
+    viet_spellchecker = phunspell.Phunspell('vi_VN')
+    print("Vietnamese spellchecker initialized successfully.")
+except Exception as e:
+    print(f"CRITICAL: Could not initialize Vietnamese spellchecker: {e}")
+    viet_spellchecker = None
 
-
-def encode_image_to_base64(pil_img):
-    """Encodes a PIL image to a base64 string."""
-    if pil_img is None:
-        return None
-    buffered = io.BytesIO()
-    pil_img.save(buffered, format="PNG")
-    return base64.b64encode(buffered.getvalue()).decode('utf-8')
+# Khởi tạo phunspell cho tiếng Anh
+try:
+    eng_spellchecker = phunspell.Phunspell('en_US')
+    print("English spellchecker initialized successfully.")
+except Exception as e:
+    print(f"CRITICAL: Could not initialize English spellchecker: {e}")
+    eng_spellchecker = None
 
 @app.route('/')
 def health_check():
     return jsonify({'status': 'Flask backend is running.'})
-
-@app.route('/classify', methods=['POST'])
-def classify_blocks():
-    if 'image' not in request.files:
-        return jsonify({'error': 'No image part'}), 400
-    file = request.files['image']
-    if file.filename == '':
-        return jsonify({'error': 'No selected file'}), 400
-    
-    user_id = request.form.get('user_id')
-    language = request.form.get('language', 'eng').lower()
-
-    if not user_id:
-        return jsonify({'error': 'No user_id provided'}), 400
-
-    cur = None
-    try:
-        # --- Read image into memory first for processing ---
-        image_data = file.read()
-        pil_img = Image.open(io.BytesIO(image_data))
-
-        # --- FIX: Apply EXIF orientation correction ---
-        pil_img = ImageOps.exif_transpose(pil_img)
-        
-        # --- Now convert to RGB after orientation is fixed ---
-        pil_img = pil_img.convert("RGB")
-
-        # --- Now, save the original image data to a file for record-keeping ---
-        filename = secure_filename(f"{user_id}_{file.filename}")
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        with open(filepath, 'wb') as f:
-            f.write(image_data)
-
-        cur = mysql.connection.cursor()
-        cur.execute("INSERT INTO images (user_id, image_path) VALUES (%s, %s)", (user_id, filepath))
-        image_id = cur.lastrowid
-        
-        # --- Process the image for OCR using imported pipelines (pil_img is already loaded) ---
-        recognized_text = ""
-        vis_img = None
-
-        if language in ['vie', 'vi', 'vietnamese']:
-            print("Running Vietnamese OCR pipeline via import...")
-            # Unpack the results from the Vietnamese pipeline
-            # The second element is the post-processed text we want
-            raw_text, post_processed_text, _, _, _, vis_img = process_vietnamese(pil_img)
-            recognized_text = post_processed_text
-        else:
-            print("Running English OCR pipeline via import...")
-            # Unpack the results from the English pipeline
-            # The first element is the text we want
-            raw_text, _, _, _, vis_img = process_english(pil_img)
-            recognized_text = raw_text
-
-        vis_base64 = encode_image_to_base64(vis_img)
-
-        # --- Store OCR results in DB ---
-        if image_id and recognized_text:
-            cur.execute("INSERT INTO results (image_id, recognized_text) VALUES (%s, %s)", (image_id, recognized_text))
-        
-        mysql.connection.commit()
-
-        # --- Format the response for the Android client ---
-        # The client expects a 'results' array of objects, with each object having a 'text' key.
-        # We'll create a single result object containing all the recognized text.
-        api_results = [{'text': recognized_text}]
-
-        print(f"Pipeline finished. Returning {len(recognized_text.splitlines())} lines of text.")
-        return jsonify({'results': api_results, 'visualization': vis_base64}), 200
-
-    except Exception as e:
-        if cur:
-            mysql.connection.rollback()
-        print(f"Error in /classify endpoint: {e}")
-        return jsonify({'error': f'An unexpected error occurred: {str(e)}'}), 500
-    finally:
-        if cur:
-            cur.close()
 
 @app.route('/register', methods=['POST'])
 def register():
@@ -166,8 +86,6 @@ def get_history(user_id):
     cur = None
     try:
         cur = mysql.connection.cursor()
-        # Fetch all records for the user, ordered by time
-        # IMPORTANT: Fetch the image ID (i.id) to identify records for deletion
         query = """
         SELECT i.id, i.image_path, r.recognized_text, i.uploaded_at
         FROM images i
@@ -181,14 +99,13 @@ def get_history(user_id):
         if not history_records:
             return jsonify([]), 200
 
-        # Group records into sessions based on timestamp
         sessions = []
         if history_records:
             current_session_records = [history_records[0]]
-            SESSION_TIMEOUT_SECONDS = 30  # Increased timeout for more robust session grouping
+            SESSION_TIMEOUT_SECONDS = 30
 
             for i in range(1, len(history_records)):
-                prev_timestamp = current_session_records[-1][3] # Index 3 is uploaded_at
+                prev_timestamp = current_session_records[-1][3]
                 current_timestamp = history_records[i][3]
                 
                 if (current_timestamp - prev_timestamp).total_seconds() < SESSION_TIMEOUT_SECONDS:
@@ -196,15 +113,13 @@ def get_history(user_id):
                 else:
                     sessions.append(current_session_records)
                     current_session_records = [history_records[i]]
-            sessions.append(current_session_records) # Add the last session
+            sessions.append(current_session_records)
 
-        # Format the sessions for the response
         history_list = []
-        # A simple counter to act as a session ID for this request
         temp_session_id_counter = 0
-        for session_records in reversed(sessions): # Show newest sessions first
+        for session_records in reversed(sessions):
             session_details = []
-            session_image_ids = [] # Collect image IDs for this session
+            session_image_ids = []
             
             for record in session_records:
                 image_id, image_path, recognized_text, _ = record
@@ -223,8 +138,8 @@ def get_history(user_id):
             
             if session_details:
                 history_list.append({
-                    'session_id': temp_session_id_counter, # a temporary ID for the client
-                    'image_ids': session_image_ids, # The important part for deletion
+                    'session_id': temp_session_id_counter,
+                    'image_ids': session_image_ids,
                     'timestamp': session_records[0][3].strftime('%Y-%m-%d %H:%M:%S'),
                     'image_count': len(session_records),
                     'results': session_details
@@ -252,28 +167,17 @@ def delete_history_session():
     try:
         cur = mysql.connection.cursor()
         
-        # To be safe, ensure all IDs are integers
         image_ids_to_delete = [int(id) for id in image_ids_to_delete]
-        
-        # Create placeholders for the IN clause
         placeholders = ','.join(['%s'] * len(image_ids_to_delete))
         
-        # Delete from results first (child table)
         sql_delete_results = f"DELETE FROM results WHERE image_id IN ({placeholders})"
         cur.execute(sql_delete_results, image_ids_to_delete)
         
-        # Delete from images (parent table)
         sql_delete_images = f"DELETE FROM images WHERE id IN ({placeholders})"
         cur.execute(sql_delete_images, image_ids_to_delete)
         
         mysql.connection.commit()
         
-        # Optionally, delete the image files from the server
-        # This part is commented out as it requires fetching paths before deleting DB records.
-        # It's safer to have a separate cleanup script for orphaned files.
-        # for image_id in image_ids_to_delete:
-        #    ... find path and os.remove(path) ...
-
         return jsonify({'message': f'Successfully deleted session with {len(image_ids_to_delete)} images.'}), 200
 
     except Exception as e:
@@ -305,8 +209,78 @@ def add_history():
     cur.close()
     return jsonify({'message': 'History saved successfully'}), 200
 
+@app.route('/spellcheck', methods=['POST'])
+def spellcheck():
+    data = request.get_json()
+    text = data.get('text', '')
+    language = data.get('language', 'vi_VN')
+
+    print(f"[spellcheck] Nhận request với text: {text[:100]}... (length={len(text)}) và language: {language}")
+
+    if not text:
+        print("[spellcheck] Không có text gửi lên!")
+        return jsonify({'error': 'No text provided'}), 400
+    
+    spellchecker = None
+    if language in ['en', 'en_US', 'en-US', 'english']:
+        if eng_spellchecker is None:
+            print("[spellcheck] English spellchecker chưa sẵn sàng!")
+            return jsonify({'error': 'English spellchecker is not available on the server.'}), 500
+        spellchecker = eng_spellchecker
+        language = 'en'
+    elif language in ['vi', 'vi_vn', 'vi-VN', 'vietnamese', 'vie', 'vi_VN']:
+        if viet_spellchecker is None:
+            print("[spellcheck] Vietnamese spellchecker chưa sẵn sàng!")
+            return jsonify({'error': 'Vietnamese spellchecker is not available on the server.'}), 500
+        spellchecker = viet_spellchecker
+        language = 'vi'
+    else:
+        print(f"[spellcheck] Ngôn ngữ không hỗ trợ: {language}")
+        return jsonify({'error': 'Language not supported.'}), 400
+
+    try:
+        typos = []
+        # Use re.finditer to get words and their positions. [\w'-]+ matches words with letters, numbers, underscore, hyphen, or apostrophe.
+        for match in re.finditer(r"[\w'-]+", text):
+            word = match.group(0)
+            
+            # Check spelling of the word
+            if not spellchecker.lookup(word):
+                suggestions = list(spellchecker.suggest(word))
+                # Only consider it a typo if there are suggestions
+                if suggestions:
+                    start, end = match.span()
+                    typos.append({
+                        'word': word,
+                        'start': start,
+                        'end': end,
+                        'suggestions': suggestions
+                    })
+        
+        # Generate corrected_text by replacing typos in the original text
+        # Process replacements from the end to avoid messing up indices of unprocessed typos.
+        corrected_text_list = list(text)
+        for typo in sorted(typos, key=lambda x: x['start'], reverse=True):
+            suggestions = typo['suggestions']
+            if suggestions:
+                start = typo['start']
+                end = typo['end']
+                replacement = suggestions[0]
+                corrected_text_list[start:end] = list(replacement)
+        
+        corrected_text = "".join(corrected_text_list)
+
+        print(f"[spellcheck] Hoàn thành. Số từ sửa: {len(typos)}. Trả kết quả về client với thông tin chi tiết.")
+        return jsonify({
+            'corrected_text': corrected_text,
+            'typos': typos
+        }), 200
+    except Exception as e:
+        print(f"Error during spellcheck: {e}")
+        return jsonify({'error': f'An error occurred during spellcheck: {str(e)}'}), 500
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Run Flask app on a specified port')
     parser.add_argument('--port', type=int, default=5000, help='Port to run the Flask app on')
     args = parser.parse_args()
-    app.run(debug=True, port=args.port)
+    app.run(host='0.0.0.0', debug=True, port=args.port)

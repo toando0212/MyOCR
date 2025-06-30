@@ -1,2 +1,0 @@
-ninja: Entering directory `D:\MyOCR\sdk\.cxx\Debug\1t1q3hfn\arm64-v8a'
-ninja: no work to do.

@@ -54,4 +54,11 @@
     <string name="toast_corner_suggestion">Để có kết quả tốt nhất, vui lòng đảm bảo ảnh chụp có đủ 4 góc của tài liệu.</string>
     <string name="need_internet_vi">Cần internet để sửa lỗi chính tả</string>
     <string name="need_internet_en">Internet is required for spell check</string>
+    <string name="spell_check_result">Kết quả sửa lỗi chính tả</string>
+    <string name="confirm">Xác nhận</string>
+    <string name="undo">Hoàn tác</string>
+    <string name="spell_check_applied">Đã áp dụng sửa lỗi chính tả!</string>
+    <string name="undo_successful">Đã hoàn tác thay đổi!</string>
+    <string name="replacement_chosen">Chọn từ thay thế cho từ này</string> 
+    <string name="no_suggestions_available">Không có gợi ý thay thế nào cho từ này.</string>
 </resources>

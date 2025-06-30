@@ -105,6 +105,7 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
     private static final int REQUEST_CAMERA_PERMISSION = 100;
     private static final int REQUEST_WRITE_STORAGE_PERMISSION = 102; // For export
     private static final int REQUEST_CODE_CREATE_PDF = 2001;
+    private static final int REQUEST_CODE_CREATE_DOCX = 2002;
     private RecyclerView imageRecyclerView;
     private ImageAdapter imageAdapter;
     private List<Uri> imageUris = new ArrayList<>();
@@ -154,7 +155,7 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
             .writeTimeout(60, TimeUnit.SECONDS)
             .readTimeout(60, TimeUnit.SECONDS)
             .build();
-    private static final String BASE_URL = "https://7c2c-2405-4803-f801-12a0-1883-6ffe-89a4-5660.ngrok-free.app"; // IMPORTANT: Use your actual server URL
+    public static final String BASE_URL = "http://192.168.1.229:5000"; // IMPORTANT: Replace '192.168.x.x' with your actual server IP address
 
     private Uri pendingExportPdfUri = null;
 
@@ -226,7 +227,7 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
 
         // Setup for the OCR results RecyclerView
         ocrResultRecyclerView = findViewById(R.id.ocrResultRecyclerView);
-        ocrResultAdapter = new OcrResultAdapter(this, ocrResultList, radioEnglish.isChecked());
+        ocrResultAdapter = new OcrResultAdapter(this, ocrResultList, radioEnglish.isChecked(), client);
         ocrResultRecyclerView.setLayoutManager(new LinearLayoutManager(this));
         ocrResultRecyclerView.setAdapter(ocrResultAdapter);
 
@@ -319,7 +320,7 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
             }
             // Cập nhật adapter khi đổi ngôn ngữ
             if (ocrResultAdapter != null) {
-                ocrResultAdapter = new OcrResultAdapter(this, ocrResultList, "en".equals(newLang));
+                ocrResultAdapter = new OcrResultAdapter(this, ocrResultList, "en".equals(newLang), client);
                 ocrResultRecyclerView.setAdapter(ocrResultAdapter);
             }
         });
@@ -442,7 +443,7 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
              new Thread(() -> {
                  try {
                     // Load English models
-                    detectionSession = ortEnv.createSession(assetFilePath("db_mobilenet_v3_large.onnx"), new OrtSession.SessionOptions());
+                    detectionSession = ortEnv.createSession(assetFilePath("db_mobilenet_v3_large_copy.onnx"), new OrtSession.SessionOptions()); // Changed to db_mobilenet_v3_large.onnx
                     englishRecognitionSession = ortEnv.createSession(assetFilePath("crnn_mobilenet_v3_large.onnx"), new OrtSession.SessionOptions());
 
                     // Load Vietnamese models by initializing VietOcr class
@@ -456,7 +457,7 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
                     });
 
                  } catch (Exception e) {
-                     Log.e("MainActivity", "Failed to load ONNX models", e);
+                     Log.e("MainActivity", "Failed to load ONNX models", e); 
                      runOnUiThread(() -> Toast.makeText(MainActivity.this, "Error loading models: " + e.getMessage(), Toast.LENGTH_LONG).show());
                  }
              }).start();
@@ -471,7 +472,7 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
         for (Uri uri : imageUris) {
             ocrResultList.add(new OcrResult(uri, true));
         }
-        ocrResultAdapter = new OcrResultAdapter(this, ocrResultList, radioEnglish.isChecked());
+        ocrResultAdapter = new OcrResultAdapter(this, ocrResultList, radioEnglish.isChecked(), client);
         ocrResultRecyclerView.setAdapter(ocrResultAdapter);
         // Get the language choice from UI thread here, before starting background processing
         final String selectedLang = radioVietnamese.isChecked() ? "vi" : "en";
@@ -658,7 +659,7 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
     }
 
     private List<RotatedRect> runDetection(Bitmap bitmap) throws Exception {
-        int targetSize = 512;
+        int targetSize = 1024; // Changed to 1024 to match DBNet input size
         // The ratio of the original image
         double ratio = (double) bitmap.getWidth() / (double) bitmap.getHeight();
 
@@ -680,8 +681,9 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
         int top = (targetSize - resizedHeight) / 2;
         int left = (targetSize - resizedWidth) / 2;
 
-        float[] mean = {0.485f, 0.456f, 0.406f};
-        float[] std = {0.229f, 0.224f, 0.225f};
+        // Updated mean and std for doctr DBNet models
+        float[] mean = {0.798f, 0.785f, 0.772f};
+        float[] std = {0.264f, 0.2749f, 0.287f};
 
         FloatBuffer inputBuffer = preprocessImageForDetection(bitmap, targetSize, resizedWidth, resizedHeight, mean, std);
         long[] shape = {1, 3, targetSize, targetSize};
@@ -712,7 +714,6 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
         }
         
         // --- 2. Apply Sigmoid to get Probability Map ---
-        // This converts the raw model output (logits) into probabilities [0, 1]
         Mat probMapMat = new Mat(height, width, CvType.CV_32F);
         for (int y = 0; y < height; y++) {
             for (int x = 0; x < width; x++) {
@@ -720,15 +721,18 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
                 probMapMat.put(y, x, (float) (1.0 / (1.0 + Math.exp(-logit))));
             }
         }
-        logitsMat.release(); // free memory
+        logitsMat.release();
 
         // --- 3. Binarization ---
-        // Equivalent to `bitmap = prob_map > bin_thresh` in the python code.
-        // For DBPostProcessor, the default bin_thresh is 0.3.
+        float binThresh = 0.3f; // Changed to match DBNet default
         Mat binaryMap = new Mat();
-        float binThresh = 0.3f;
-        Imgproc.threshold(probMapMat, binaryMap, binThresh, 255, Imgproc.THRESH_BINARY);
+        Imgproc.threshold(probMapMat, binaryMap, binThresh, 255, Imgproc.THRESH_BINARY); // Binarize
         binaryMap.convertTo(binaryMap, CvType.CV_8U);
+
+        // --- Apply morphological opening (erosion then dilation) like doctr DBNet ---
+        Mat openingKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, new Size(3, 3));
+        Imgproc.morphologyEx(binaryMap, binaryMap, Imgproc.MORPH_OPEN, openingKernel);
+        openingKernel.release();
 
         // --- 4. Find Contours ---
         List<MatOfPoint> contours = new ArrayList<>();
@@ -739,10 +743,9 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
 
         List<RotatedRect> validBoxes = new ArrayList<>();
         // Scaling factor to map coordinates from the resized image (inside the canvas) back to the original image
-        double scale = (double) originalWidth / resizedWidth;
-        if (originalWidth < originalHeight) {
-            scale = (double) originalHeight / resizedHeight;
-        }
+        // This scaling assumes the image was padded to fit the target size.
+        double scaleW = (double) originalWidth / resizedWidth;
+        double scaleH = (double) originalHeight / resizedHeight;
 
         // --- 5. Filter Contours & Unclip ---
         for (MatOfPoint contour : contours) {
@@ -757,7 +760,7 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
 
             // --- 5b. Calculate confidence score from the probability map ---
             Mat mask = Mat.zeros(height, width, CvType.CV_8U);
-            Imgproc.drawContours(mask, Collections.singletonList(contour), -1, new Scalar(255), -1);
+            Imgproc.drawContours(mask, Collections.singletonList(contour), -1, new Scalar(255), -1); // Draw contour filled
             Scalar meanScoreScalar = Core.mean(probMapMat, mask);
             mask.release();
             float score = (float) meanScoreScalar.val[0];
@@ -769,7 +772,7 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
                 continue;
             }
 
-            // --- 6. Unclip Polygon (using dilation as an approximation for pyclipper) ---
+            // --- 6. Unclip Polygon (approximating pyclipper with dilation) ---
             double area = Imgproc.contourArea(contour);
             double length = Imgproc.arcLength(contour2f, true);
             if (length == 0) { // Avoid division by zero
@@ -778,44 +781,67 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
                 continue;
             }
 
-            double unclipRatio = 1.5; // From DBPostProcessor defaults
-            double distance = (area * unclipRatio) / length;
-            int offset = (int) Math.round(distance);
-            offset = Math.max(1, offset); // Ensure at least a minimal expansion
+            // Unclip ratio for DBNet is 1.5
+            double unclipRatio = 1.5; // Changed to match DBNet default
+            double distance = (area * unclipRatio) / (length + 1e-6); // Added epsilon to avoid division by zero
 
-            Mat unclipKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, new Size(2 * offset + 1, 2 * offset + 1));
+            // Dilate the contour mask by 'distance' to unclip it.
+            // Using a circular kernel for more even expansion, or a square for simpler approx.
+            // A simple dilation kernel based on distance is an approximation of pyclipper.
+            // The size needs to be odd, so 2*r+1
+            int kernelSize = (int) Math.round(distance * 2) + 1; // Double distance for kernel diameter
+            if (kernelSize < 3) kernelSize = 3; // Minimum kernel size
+            if (kernelSize % 2 == 0) kernelSize++; // Ensure odd size
 
-            Mat dilatedContourMask = new Mat();
-            Mat tempMask = Mat.zeros(height, width, CvType.CV_8U);
-            Imgproc.drawContours(tempMask, Collections.singletonList(contour), 0, new Scalar(255), -1);
-            Imgproc.dilate(tempMask, dilatedContourMask, unclipKernel);
-            tempMask.release();
+            Mat unclipKernel = Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, new Size(kernelSize, kernelSize)); // Ellipse for smoother expansion
+
+            Mat unclippedMask = Mat.zeros(height, width, CvType.CV_8U);
+            Imgproc.drawContours(unclippedMask, Collections.singletonList(contour), -1, new Scalar(255), -1); // Draw original contour filled
+            Imgproc.dilate(unclippedMask, unclippedMask, unclipKernel);
             unclipKernel.release();
 
-            List<MatOfPoint> dilatedContours = new ArrayList<>();
-            Imgproc.findContours(dilatedContourMask, dilatedContours, new Mat(), Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE);
-            dilatedContourMask.release();
+            List<MatOfPoint> unclippedContours = new ArrayList<>();
+            Imgproc.findContours(unclippedMask, unclippedContours, new Mat(), Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE);
+            unclippedMask.release();
 
             RotatedRect box;
-            if (!dilatedContours.isEmpty() && dilatedContours.get(0).total() > 0) {
-                box = Imgproc.minAreaRect(new MatOfPoint2f(dilatedContours.get(0).toArray()));
-                for (MatOfPoint c : dilatedContours) c.release();
+            if (!unclippedContours.isEmpty() && unclippedContours.get(0).total() > 0) {
+                // Take the largest unclipped contour if multiple are found (pyclipper often returns one)
+                MatOfPoint largestUnclippedContour = unclippedContours.get(0);
+                for(int i = 1; i < unclippedContours.size(); i++){
+                    if(Imgproc.contourArea(unclippedContours.get(i)) > Imgproc.contourArea(largestUnclippedContour)){
+                        largestUnclippedContour = unclippedContours.get(i);
+                    }
+                }
+                box = Imgproc.minAreaRect(new MatOfPoint2f(largestUnclippedContour.toArray()));
+                for (MatOfPoint c : unclippedContours) c.release();
             } else {
-                box = Imgproc.minAreaRect(contour2f); // Fallback
+                box = Imgproc.minAreaRect(contour2f); // Fallback to original contour's minAreaRect
             }
 
             // --- 7. Scale box to original image coordinates ---
-            double centerX = (box.center.x - padLeft) * scale;
-            double centerY = (box.center.y - padTop) * scale;
-            double w = box.size.width * scale;
-            double h = box.size.height * scale;
+            // Adjust center coordinates based on padding, then scale.
+            double centerX = (box.center.x - padLeft) * scaleW; // Use scaleW for x
+            double centerY = (box.center.y - padTop) * scaleH; // Use scaleH for y
+            double w = box.size.width * scaleW; // Use scaleW for width
+            double h = box.size.height * scaleH; // Use scaleH for height
 
             Point center = new Point(centerX, centerY);
             Size size = new Size(w, h);
 
             RotatedRect scaledBox = new RotatedRect(center, size, box.angle);
+            // --- Bỏ các box nhỏ (width < 2 hoặc height < 2) ---
+            Point[] pts = new Point[4];
+            scaledBox.points(pts);
+            // Calculate actual width and height of the rotated box based on points
+            double boxWidth = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+            double boxHeight = Math.hypot(pts[1].x - pts[2].x, pts[1].y - pts[2].y);
+            if (boxWidth < 2 || boxHeight < 2) {
+                contour.release();
+                contour2f.release();
+                continue;
+            }
             validBoxes.add(scaledBox);
-
             contour.release();
             contour2f.release();
         }
@@ -1599,17 +1625,19 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
         }
     
         if ("pdf".equals(format)) {
-            // Mở trình chọn file để user chọn tên và vị trí lưu
             Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
             intent.addCategory(Intent.CATEGORY_OPENABLE);
             intent.setType("application/pdf");
             intent.putExtra(Intent.EXTRA_TITLE, "OCR_Result.pdf");
             startActivityForResult(intent, REQUEST_CODE_CREATE_PDF);
-            // Lưu nội dung tạm thời để export sau khi user chọn xong
             pendingExportPdfUri = null; // reset
-            // Lưu nội dung vào biến toàn cục nếu cần (hoặc có thể truyền qua intent nếu muốn nâng cao)
-            // Ở đây, để đơn giản, ta sẽ gọi lại exportToFile khi nhận được kết quả
-            // (xử lý ở onActivityResult)
+            return;
+        } else if ("docx".equals(format)) {
+            Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+            intent.addCategory(Intent.CATEGORY_OPENABLE);
+            intent.setType("application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+            intent.putExtra(Intent.EXTRA_TITLE, "OCR_Result.docx");
+            startActivityForResult(intent, REQUEST_CODE_CREATE_DOCX);
             return;
         }
     
@@ -1744,15 +1772,32 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
                     PdfWriter.getInstance(document, os);
                     document.open();
                     try {
-                        InputStream fontStream = getAssets().open("fonts/vuTimes.ttf");
+                        InputStream fontStream = getAssets().open("fonts/font-times-new-roman/times_400.ttf");
                         byte[] fontBytes = getBytes(fontStream);
-                        BaseFont bf = BaseFont.createFont("vuTimes.ttf", BaseFont.IDENTITY_H, BaseFont.EMBEDDED, false, fontBytes, null);
+                        BaseFont bf = BaseFont.createFont("times_400.ttf", BaseFont.IDENTITY_H, BaseFont.EMBEDDED, false, fontBytes, null);
                         Font font = new Font(bf, 12);
                         document.add(new Paragraph(fullTextForExport(), font));
                     } catch (IOException e) {
                         document.add(new Paragraph(fullTextForExport()));
                     }
                     document.close();
+                    Toast.makeText(this, "Exported successfully", Toast.LENGTH_LONG).show();
+                } catch (Exception e) {
+                    Toast.makeText(this, "Error exporting file: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                }
+            }
+        } else if (requestCode == REQUEST_CODE_CREATE_DOCX && resultCode == RESULT_OK && data != null) {
+            Uri uri = data.getData();
+            if (uri != null) {
+                try (OutputStream os = getContentResolver().openOutputStream(uri)) {
+                    XWPFDocument document = new XWPFDocument();
+                    String[] lines = fullTextForExport().split("\n");
+                    for (String line : lines) {
+                        XWPFParagraph paragraph = document.createParagraph();
+                        XWPFRun run = paragraph.createRun();
+                        run.setText(line);
+                    }
+                    document.write(os);
                     Toast.makeText(this, "Exported successfully", Toast.LENGTH_LONG).show();
                 } catch (Exception e) {
                     Toast.makeText(this, "Error exporting file: " + e.getMessage(), Toast.LENGTH_LONG).show();
