@@ -61,4 +61,9 @@
     <string name="undo_successful">Đã hoàn tác thay đổi!</string>
     <string name="replacement_chosen">Chọn từ thay thế cho từ này</string> 
     <string name="no_suggestions_available">Không có gợi ý thay thế nào cho từ này.</string>
+    <string name="no_results_available">Không có kết quả nào.</string>
+    <string name="save_session">Lưu phiên</string>
+    <string name="spell_check_results_title">Kết quả kiểm tra chính tả</string>
+    <string name="apply_changes">Áp dụng</string>
+    <string name="undo_changes">Hoàn tác</string>
 </resources>

@@ -97,7 +97,7 @@
     <string name="stop_ocr_title">Stop Process</string>
     <string name="stop_ocr_confirmation">Are you sure you want to stop the OCR process?</string>
     <string name="ocr_stopped_message">OCR process stopped.</string>
-    <string name="long_press_to_delete">Long press on an image to delete</string>
+    <string name="long_press_to_delete">Long-press on an image to delete it.</string>
     <string name="confirm">Confirm</string>
     <string name="save">Save</string>
     <string name="reset">Reset</string>
@@ -116,4 +116,11 @@
     <string name="undo_successful">Undo successful!</string>
     <string name="replacement_chosen">Replacement chosen for this word </string>
     <string name="no_suggestions_available">No suggestions available for this word.</string>
+    <string name="new_session">New Session</string>
+    <string name="logout">Log Out</string>
+    <string name="no_results_available">No result available.</string>
+    <string name="save_session">Save Session</string>
+    <string name="spell_check_results_title">Spell Check Results</string>
+    <string name="apply_changes">Apply</string>
+    <string name="undo_changes">Undo</string>
 </resources>

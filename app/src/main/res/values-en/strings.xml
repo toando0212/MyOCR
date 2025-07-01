@@ -46,6 +46,13 @@
     <string name="yes">Yes</string>
     <string name="no">No</string>
     <string name="ocr_stopped_message">OCR process stopped by user.</string>
-    <string name="long_press_to_delete">Long-press on an image to delete</string>
+    <string name="long_press_to_delete">Long-press on an image to delete it.</string>
     <string name="toast_corner_suggestion">For best results, please ensure the photo captures all four corners of the document.</string>
+    <string name="new_session">New Session</string>
+    <string name="logout">Log Out</string>
+    <string name="no_results_available">No result available.</string>
+    <string name="save_session">Save Session</string>
+    <string name="spell_check_results_title">Spell Check Results</string>
+    <string name="apply_changes">Apply</string>
+    <string name="undo_changes">Undo</string>
 </resources> 

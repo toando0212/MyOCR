@@ -64,4 +64,11 @@ public class Page {
     public String getContent() {
         return content;
     }
+
+    /**
+     * Returns a new Page with the same properties but updated content.
+     */
+    public Page updateContent(String newContent) {
+        return new Page(blocks, pageIndex, width, height, previewImage, newContent);
+    }
 } 

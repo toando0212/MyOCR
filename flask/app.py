@@ -8,6 +8,7 @@ import base64
 import argparse
 import phunspell
 import re
+import time
 # from spellchecker import SpellChecker
 
 # Global constants
@@ -197,14 +198,18 @@ def add_history():
     if not user_id or not recognized_text or not file:
         return jsonify({'error': 'Missing data'}), 400
 
-    filename = secure_filename(f'{user_id}_{file.filename}')
+    # Make the filename unique using a timestamp
+    timestamp = int(time.time())
+    original_filename = secure_filename(file.filename)
+    filename = f'{user_id}_{timestamp}_{original_filename}'
+    
     filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
     file.save(filepath)
 
     cur = mysql.connection.cursor()
     cur.execute("INSERT INTO images (user_id, image_path) VALUES (%s, %s)", (user_id, filepath))
     image_id = cur.lastrowid
-    cur.execute("INSERT INTO results (image_id, recognized_text) VALUES (%s, %s)", (image_id, recognized_text))
+    cur.execute("INSERT INTO results (image_id, recognized_text, user_id) VALUES (%s, %s, %s)", (image_id, recognized_text, user_id))
     mysql.connection.commit()
     cur.close()
     return jsonify({'message': 'History saved successfully'}), 200

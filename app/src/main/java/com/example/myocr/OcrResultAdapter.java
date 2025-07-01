@@ -41,11 +41,13 @@ import android.app.AlertDialog;
 import android.widget.ScrollView;
 import android.widget.EditText;
 import android.text.SpannableString;
+import android.text.SpannableStringBuilder;
 import android.text.Spanned;
 import android.text.style.ForegroundColorSpan;
 import android.text.style.ClickableSpan;
 import android.view.MotionEvent;
 import android.text.method.LinkMovementMethod;
+import java.util.ArrayList;
 
 public class OcrResultAdapter extends RecyclerView.Adapter<OcrResultAdapter.ViewHolder> {
 
@@ -125,9 +127,15 @@ public class OcrResultAdapter extends RecyclerView.Adapter<OcrResultAdapter.View
                 } else {
                     holder.ivPreview.setVisibility(View.GONE);
                 }
+            } else if (result.getText() != null && !result.getText().isEmpty()) {
+                // This is the new case: For results loaded from history that have text but no Page object.
+                holder.tvOcrResult.setText(result.getText());
+                holder.tvOcrResult.setTextColor(ContextCompat.getColor(context, android.R.color.black));
+                // No preview image is available in this case
+                holder.ivPreview.setVisibility(View.GONE);
             } else {
                 // Handle case where processing is done but page is null and no error
-                holder.tvOcrResult.setText("No result available.");
+                holder.tvOcrResult.setText(context.getString(R.string.no_results_available));
                 holder.ivPreview.setVisibility(View.GONE);
             }
         }
@@ -336,241 +344,179 @@ public class OcrResultAdapter extends RecyclerView.Adapter<OcrResultAdapter.View
     }
 
     private void showSpellCheckDialogWithTypos(String originalText, String fixedText, JSONArray typosArray, OcrResult result, int position, Button btnSpellCheck) {
-        Log.d("SpellCheckDebug", "showSpellCheckDialogWithTypos START");
         AlertDialog.Builder builder = new AlertDialog.Builder(context);
-        String title = context.getString(R.string.spell_check_result);
-        String btnConfirm = context.getString(R.string.confirm);
-        String btnCancel = context.getString(R.string.cancel);
-        String btnUndo = context.getString(R.string.undo);
+        String title = context.getString(R.string.spell_check_results_title);
         String toastApplied = context.getString(R.string.spell_check_applied);
         String toastUndo = context.getString(R.string.undo_successful);
         builder.setTitle(title);
+
         ScrollView scrollView = new ScrollView(context);
         TextView textView = new TextView(context);
         textView.setTextIsSelectable(true);
-
-        // Lưu trạng thái trước đó để Undo
-        final String[] prevText = {originalText};
-        final JSONArray[] prevTypos = {null};
-        try {
-            prevTypos[0] = typosArray != null ? new JSONArray(typosArray.toString()) : new JSONArray();
-        } catch (org.json.JSONException e) {
-            e.printStackTrace();
-            prevTypos[0] = new JSONArray();
-        }
-
-        // Split the original text into lines to preserve structure
-        String[] originalLines = originalText.split("\n");
-        StringBuilder displayText = new StringBuilder();
-        int charIndex = 0;
-        for (String line : originalLines) {
-            displayText.append(line);
-            charIndex += line.length();
-            if (charIndex < originalText.length()) {
-                displayText.append("\n");
-                charIndex++;
-            }
-        }
-
-        SpannableString spannable = new SpannableString(displayText.toString());
+        textView.setPadding(48, 16, 48, 16); // Add some padding for better look
+        textView.setTextSize(16f);
+        
+        // This will hold the text content and all the clickable spans
+        SpannableStringBuilder spannableBuilder = new SpannableStringBuilder(originalText);
+        
+        // We will pass this 'typosArray' to the suggestion dialog so it can be modified
+        final List<JSONObject> typoList = new ArrayList<>();
         if (typosArray != null) {
             for (int i = 0; i < typosArray.length(); i++) {
                 try {
-                    JSONObject typo = typosArray.getJSONObject(i);
-                    String word = typo.getString("word");
-                    int start = typo.getInt("start");
-                    int end = typo.getInt("end");
-                    JSONArray suggestions = typo.getJSONArray("suggestions");
-
-                    if (start >= 0 && end <= displayText.length()) {
-                        spannable.setSpan(new ForegroundColorSpan(android.graphics.Color.RED), start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
-                        final String[] suggestionList = new String[suggestions.length()];
-                        for (int k = 0; k < suggestions.length(); k++) {
-                            suggestionList[k] = suggestions.getString(k);
-                        }
-                        final String finalFixedText = displayText.toString();
-                        final int finalStart = start;
-                        final int finalEnd = end;
-                        final OcrResult finalResult = result;
-                        final int finalPosition = position;
-                        spannable.setSpan(new ClickableSpan() {
-                            @Override
-                            public void onClick(View widget) {
-                                // Lưu trạng thái trước khi sửa để Undo
-                                prevText[0] = textView.getText().toString();
-                                try {
-                                    prevTypos[0] = new JSONArray(typosArray.toString());
-                                } catch (org.json.JSONException e) {
-                                    e.printStackTrace();
-                                    prevTypos[0] = new JSONArray();
-                                }
-                                showSuggestionsDialog(word, suggestionList, finalFixedText, finalStart, finalEnd, finalResult, finalPosition, btnSpellCheck, prevText, prevTypos);
-                            }
-                        }, start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
-                    }
-                } catch (Exception e) {
-                    Log.e("SpellCheckDebug", "Error processing typo: " + e.getMessage());
-                }
+                    typoList.add(typosArray.getJSONObject(i));
+                } catch (Exception e) {}
             }
         }
-
-        textView.setText(spannable);
+        
+        // Apply spans for all typos
+        applyTyposToSpannable(spannableBuilder, typoList, textView, result, position, btnSpellCheck);
+        
+        textView.setText(spannableBuilder);
         textView.setMovementMethod(LinkMovementMethod.getInstance());
-        textView.setOnTouchListener((v, event) -> {
-            if (event.getAction() == MotionEvent.ACTION_UP) {
-                textView.setFocusable(false);
-            }
-            return false;
-        });
-        textView.setMinLines(6);
-        textView.setMaxLines(20);
         scrollView.addView(textView);
         builder.setView(scrollView);
-        builder.setPositiveButton(btnConfirm, (dialog, which) -> {
-            Page oldPage = result.getPage();
-            if (oldPage == null) {
-                oldPage = new Page(
-                    new java.util.ArrayList<>(),
-                    position,
-                    0,
-                    0,
-                    null,
-                    fixedText
-                );
+
+        // Apply Button
+        builder.setPositiveButton(R.string.apply_changes, (dialog, which) -> {
+            String correctedText = textView.getText().toString();
+            if (result.getPage() != null) {
+                result.getPage().updateContent(correctedText);
             }
-            Page newPage = new Page(
-                oldPage.getBlocks(),
-                oldPage.getPageIndex(),
-                oldPage.getWidth(),
-                oldPage.getHeight(),
-                oldPage.getPreviewImage(),
-                fixedText
-            );
-            result.setPage(newPage);
             notifyItemChanged(position);
             Toast.makeText(context, toastApplied, Toast.LENGTH_SHORT).show();
             btnSpellCheck.setEnabled(true);
         });
-        builder.setNegativeButton(btnCancel, (dialog, which) -> {
-            btnSpellCheck.setEnabled(true);
+
+        // Undo Button
+        builder.setNeutralButton(R.string.undo_changes, (dialog, which) -> {
+            // This button's action is set to null here. We override it later to prevent the dialog from closing.
         });
-        builder.setNeutralButton(btnUndo, (dialog, which) -> {
-            showSpellCheckDialogWithTypos(prevText[0], prevText[0], prevTypos[0], result, position, btnSpellCheck);
-            Toast.makeText(context, toastUndo, Toast.LENGTH_SHORT).show();
+
+        // Cancel Button
+        builder.setNegativeButton(android.R.string.cancel, (dialog, which) -> {
+            btnSpellCheck.setEnabled(true); // Re-enable the button on cancel
+            dialog.dismiss();
         });
-        builder.setOnCancelListener(dialog -> btnSpellCheck.setEnabled(true));
-        builder.show();
+
+        final AlertDialog dialog = builder.create();
+
+        dialog.setOnShowListener(d -> {
+            Button neutralButton = dialog.getButton(AlertDialog.BUTTON_NEUTRAL);
+            neutralButton.setOnClickListener(v -> {
+                // Manually reset the text and re-apply the spans without dismissing the dialog
+                spannableBuilder.clear();
+                spannableBuilder.append(originalText);
+                typoList.clear(); // Clear the list of applied corrections
+                try {
+                    for (int i = 0; i < typosArray.length(); i++) {
+                        typoList.add(typosArray.getJSONObject(i));
+                    }
+                } catch (Exception e) {
+                    // This will be caught by the outer try-catch
+                }
+                applyTyposToSpannable(spannableBuilder, typoList, textView, result, position, btnSpellCheck);
+                textView.setText(spannableBuilder);
+                Toast.makeText(context, toastUndo, Toast.LENGTH_SHORT).show();
+            });
+        });
+
+
+        dialog.show();
+    }
+    
+    // Helper method to apply all typo spans to the text
+    private void applyTyposToSpannable(SpannableStringBuilder spannableBuilder, List<JSONObject> typoList, TextView textView, OcrResult result, int position, Button btnSpellCheck) {
+        // First, clear any old spans
+        ClickableSpan[] oldClickableSpans = spannableBuilder.getSpans(0, spannableBuilder.length(), ClickableSpan.class);
+        for (ClickableSpan span : oldClickableSpans) {
+            spannableBuilder.removeSpan(span);
+        }
+        ForegroundColorSpan[] oldColorSpans = spannableBuilder.getSpans(0, spannableBuilder.length(), ForegroundColorSpan.class);
+        for (ForegroundColorSpan span : oldColorSpans) {
+            spannableBuilder.removeSpan(span);
+        }
+        
+        for (int i = 0; i < typoList.size(); i++) {
+            final int typoIndex = i;
+            try {
+                JSONObject typo = typoList.get(i);
+                final String word = typo.getString("word");
+                int start = typo.getInt("start");
+                int end = typo.getInt("end");
+                JSONArray suggestions = typo.getJSONArray("suggestions");
+
+                if (start >= 0 && end <= spannableBuilder.length()) {
+                    spannableBuilder.setSpan(new ForegroundColorSpan(android.graphics.Color.RED), start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                    
+                    ClickableSpan clickableSpan = new ClickableSpan() {
+                        @Override
+                        public void onClick(View widget) {
+                            showSuggestionsDialog(word, suggestions, textView, spannableBuilder, typoList, typoIndex, result, position, btnSpellCheck);
+                        }
+                    };
+                    spannableBuilder.setSpan(clickableSpan, start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                }
+            } catch (Exception e) {
+                Log.e("SpellCheckDebug", "Error applying typo span: " + e.getMessage());
+            }
+        }
     }
 
-    private void showSuggestionsDialog(String originalWord, String[] suggestions, String currentText, int start, int end, OcrResult result, int position, Button btnSpellCheck, String[] prevText, JSONArray[] prevTypos) {
+    private void showSuggestionsDialog(String originalWord, JSONArray suggestions, TextView mainTextView, SpannableStringBuilder spannableBuilder, List<JSONObject> typoList, int typoIndex, OcrResult result, int position, Button btnSpellCheck) {
         String chooseReplacement = context.getString(R.string.replacement_chosen, originalWord);
         AlertDialog.Builder builder = new AlertDialog.Builder(context);
         builder.setTitle(chooseReplacement);
-        if (suggestions.length > 0) {
-            builder.setItems(suggestions, (dialog, which) -> {
-                String selectedSuggestion = suggestions[which];
-                StringBuilder newText = new StringBuilder(currentText);
-                newText.replace(start, end, selectedSuggestion);
-                Page oldPage = result.getPage();
-                if (oldPage == null) {
-                    oldPage = new Page(
-                        new java.util.ArrayList<>(),
-                        position,
-                        0,
-                        0,
-                        null,
-                        newText.toString()
-                    );
-                }
-                Page newPage = new Page(
-                    oldPage.getBlocks(),
-                    oldPage.getPageIndex(),
-                    oldPage.getWidth(),
-                    oldPage.getHeight(),
-                    oldPage.getPreviewImage(),
-                    newText.toString()
-                );
-                result.setPage(newPage);
-                notifyItemChanged(position);
-                Toast.makeText(context, "Replaced '" + originalWord + "' with '" + selectedSuggestion + "'", Toast.LENGTH_SHORT).show();
-                recheckSpelling(newText.toString(), result, position, btnSpellCheck, isEnglishMode);
-            });
-        } else {
-            builder.setMessage(context.getString(R.string.no_suggestions_available));
-            builder.setPositiveButton(context.getString(R.string.ok), null);
-        }
-        builder.show();
-    }
-
-    // Thêm phương thức để gọi lại API kiểm tra chính tả
-    private void recheckSpelling(String text, OcrResult result, int position, Button btnSpellCheck, boolean isEnglishMode) {
-        JSONObject json = new JSONObject();
+        
         try {
-            json.put("text", text);
-            json.put("language", isEnglishMode ? "en_US" : "vi_VN");
-        } catch (Exception e) {
-            Toast.makeText(context, "Lỗi tạo request: " + e.getMessage(), Toast.LENGTH_LONG).show();
-            btnSpellCheck.setEnabled(true);
-            return;
-        }
-        String spellcheckUrl = MainActivity.BASE_URL + "/spellcheck";
-        RequestBody body = RequestBody.create(json.toString(), MediaType.get("application/json; charset=utf-8"));
-        Request request = new Request.Builder()
-                .url(spellcheckUrl)
-                .post(body)
-                .build();
-        client.newCall(request).enqueue(new Callback() {
-            @Override
-            public void onFailure(Call call, IOException e) {
-                Log.e("SpellCheckDebug", "onFailure: " + e.getMessage());
-                ((android.app.Activity) context).runOnUiThread(() -> {
-                    Toast.makeText(context, "Cần internet để sửa lỗi chính tả", Toast.LENGTH_LONG).show();
-                    btnSpellCheck.setEnabled(true);
-                });
+            final String[] suggestionItems = new String[suggestions.length()];
+            for (int k = 0; k < suggestions.length(); k++) {
+                suggestionItems[k] = suggestions.getString(k);
             }
-            @Override
-            public void onResponse(Call call, Response response) throws IOException {
-                try {
-                    Log.d("SpellCheckDebug", "onResponse START. Successful: " + response.isSuccessful());
-
-                    if (!response.isSuccessful()) {
-                        Log.e("SpellCheckDebug", "Response not successful. Code: " + response.code());
-                        ((android.app.Activity) context).runOnUiThread(() -> {
-                            Toast.makeText(context, "Lỗi server: " + response.message(), Toast.LENGTH_LONG).show();
-                            btnSpellCheck.setEnabled(true);
-                        });
-                        return;
-                    }
-
-                    final String responseBody = response.body().string();
-                    Log.d("SpellCheckDebug", "Successfully read response body. Length: " + responseBody.length());
-
-                    final JSONObject json = new JSONObject(responseBody);
-                    final String fixedText = json.optString("corrected_text", text);
-                    final JSONArray typosArray = json.optJSONArray("typos");
-                    Log.d("SpellCheckDebug", "Parsed JSON, got fixedText. Length: " + fixedText.length());
-
-                    ((android.app.Activity) context).runOnUiThread(() -> {
-                        try {
-                            Log.d("SpellCheckDebug", "Inside runOnUiThread. Preparing to show dialog.");
-                            Toast.makeText(context, "Đã nhận kết quả, đang hiển thị...", Toast.LENGTH_SHORT).show();
-                            showSpellCheckDialogWithTypos(text, fixedText, typosArray, result, position, btnSpellCheck);
-                            Log.d("SpellCheckDebug", "showSpellCheckDialog call completed.");
-                        } catch (Exception e) {
-                            Log.e("SpellCheckDebug", "ERROR inside runOnUiThread (showing dialog)", e);
-                            Toast.makeText(context, "Lỗi hiển thị kết quả: " + e.getMessage(), Toast.LENGTH_LONG).show();
-                            btnSpellCheck.setEnabled(true);
+            
+            if (suggestionItems.length > 0) {
+                builder.setItems(suggestionItems, (dialog, which) -> {
+                    String selectedSuggestion = suggestionItems[which];
+                    try {
+                        // Get the typo object to find its position
+                        JSONObject typoToFix = typoList.get(typoIndex);
+                        int start = typoToFix.getInt("start");
+                        int end = typoToFix.getInt("end");
+                        // Replace the word in the SpannableStringBuilder
+                        spannableBuilder.replace(start, end, selectedSuggestion);
+                        // Remove the fixed typo from our list
+                        typoList.remove(typoIndex);
+                        // Update the indices of all subsequent typos
+                        int delta = selectedSuggestion.length() - originalWord.length();
+                        for (int i = typoIndex; i < typoList.size(); i++) { // Start from the current index
+                            JSONObject subsequentTypo = typoList.get(i);
+                            try {
+                                subsequentTypo.put("start", subsequentTypo.getInt("start") + delta);
+                                subsequentTypo.put("end", subsequentTypo.getInt("end") + delta);
+                            } catch (org.json.JSONException e) {
+                                Log.e("SpellCheckDebug", "Error updating typo indices: " + e.getMessage());
+                            }
                         }
-                    });
-
-                } catch (Exception e) {
-                    Log.e("SpellCheckDebug", "FATAL ERROR in onResponse background task", e);
-                    ((android.app.Activity) context).runOnUiThread(() -> {
-                        Toast.makeText(context, "Lỗi xử lý phản hồi: " + e.getMessage(), Toast.LENGTH_LONG).show();
-                        btnSpellCheck.setEnabled(true);
-                    });
-                }
+                        // Re-apply all spans to the updated builder
+                        applyTyposToSpannable(spannableBuilder, typoList, mainTextView, result, position, btnSpellCheck);
+                        // Update the TextView in the main dialog
+                        mainTextView.setText(spannableBuilder);
+                        Toast.makeText(context, "Replaced '" + originalWord + "' with '" + selectedSuggestion + "'", Toast.LENGTH_SHORT).show();
+                    } catch (org.json.JSONException e) {
+                        Log.e("SpellCheckDebug", "Error handling suggestion click: " + e.getMessage());
+                        Toast.makeText(context, "Error applying suggestion.", Toast.LENGTH_SHORT).show();
+                    }
+                });
+            } else {
+                builder.setMessage(context.getString(R.string.no_suggestions_available));
+                builder.setPositiveButton(context.getString(R.string.ok), null);
             }
-        });
+        } catch (Exception e) {
+             Log.e("SpellCheckDebug", "Error showing suggestions: " + e.getMessage());
+             builder.setMessage("Error loading suggestions.");
+             builder.setPositiveButton(context.getString(R.string.ok), null);
+        }
+        
+        builder.show();
     }
 } 

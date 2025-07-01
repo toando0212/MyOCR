@@ -109,7 +109,7 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
     private RecyclerView imageRecyclerView;
     private ImageAdapter imageAdapter;
     private List<Uri> imageUris = new ArrayList<>();
-    private Button btnRunOcr, btnExport, btnStopOcr;
+    private Button btnRunOcr, btnExport, btnStopOcr, btnSaveSession;
     private ProgressBar progressBar;
     private FloatingActionButton fab;
     private Uri cameraImageUri;
@@ -143,7 +143,8 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
 
     // Views in Navigation Drawer
     private LinearLayout guestViewNav;
-    private Button btnLoginNav, btnNewSession;
+    private Button btnLoginNav, btnNewSessionNav, btnLogoutNav;
+    private View navSpacer;
     private RecyclerView historyRecyclerViewNav;
     private HistoryAdapter historyAdapterNav;
     private List<HistorySession> historySessionList = new ArrayList<>();
@@ -155,7 +156,7 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
             .writeTimeout(60, TimeUnit.SECONDS)
             .readTimeout(60, TimeUnit.SECONDS)
             .build();
-    public static final String BASE_URL = "http://192.168.1.229:5000"; // IMPORTANT: Replace '192.168.x.x' with your actual server IP address
+    public static final String BASE_URL = "http://192.168.1.229:5000"; // 
 
     private Uri pendingExportPdfUri = null;
 
@@ -208,6 +209,7 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
         btnRunOcr = findViewById(R.id.btnRunOcr);
         btnStopOcr = findViewById(R.id.btnStopOcr);
         btnExport = findViewById(R.id.btnExport);
+        btnSaveSession = findViewById(R.id.btnSaveSession);
         tvSelectLanguage = findViewById(R.id.tvSelectLanguage);
         radioVietnamese = findViewById(R.id.radioVietnamese);
         radioEnglish = findViewById(R.id.radioEnglish);
@@ -299,6 +301,7 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
         btnRunOcr.setOnClickListener(v -> runOcrOnImages());
         btnStopOcr.setOnClickListener(v -> showStopOcrConfirmationDialog());
         btnExport.setOnClickListener(v -> exportRecognizedText());
+        btnSaveSession.setOnClickListener(v -> saveCurrentSession());
         fab.setOnClickListener(view -> showImageSourceDialog());
 
         // Disable Vietnamese option as vocab is missing
@@ -342,7 +345,9 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
         // Setup views in the navigation drawer
         guestViewNav = navigationView.findViewById(R.id.guest_view_nav);
         btnLoginNav = navigationView.findViewById(R.id.btn_login_nav);
-        btnNewSession = navigationView.findViewById(R.id.btn_new_session);
+        btnNewSessionNav = navigationView.findViewById(R.id.btn_new_session_nav);
+        btnLogoutNav = navigationView.findViewById(R.id.btn_logout_nav);
+        navSpacer = navigationView.findViewById(R.id.nav_spacer);
         historyRecyclerViewNav = navigationView.findViewById(R.id.history_recycler_view_nav);
 
         // Setup adapter for history recyclerview
@@ -496,7 +501,7 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
             updateOcrUiState(false);
             // Save to history if logged in
             if (isLoggedIn && !ocrResultList.isEmpty()) {
-                saveSessionToHistory();
+                saveCurrentSession(); // Use the correct, working save method
             }
         }
     }
@@ -521,6 +526,10 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
                 Mat originalMatForCropping = new Mat();
                 Utils.bitmapToMat(cleanedBitmap, originalMatForCropping);
 
+                // Timing variables for per-block inference
+                long totalBlockTime = 0;
+                int blockCount = 0;
+
                 for (List<WordBox> wordBoxLine : lineWordBoxes) {
                     List<Word> wordsInLine = new ArrayList<>();
                     for (WordBox wordBox : wordBoxLine) {
@@ -540,6 +549,7 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
                         String recognizedText = "";
                         double confidence = 0.95; // Placeholder confidence
 
+                        long startBlock = System.nanoTime();
                         if ("vi".equals(selectedLang)) {
                             if (vietOcr == null) throw new IOException("Vietnamese OCR model is not initialized.");
                             recognizedText = vietOcr.predict(croppedBitmap);
@@ -553,6 +563,9 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
                                 recognizedText = englishVocab.decode(recOutput);
                             }
                         }
+                        long endBlock = System.nanoTime();
+                        totalBlockTime += (endBlock - startBlock);
+                        blockCount++;
 
                         wordsInLine.add(new Word(recognizedText, confidence, wordBox.box));
                         croppedMat.release();
@@ -565,6 +578,14 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
                     }
                 }
                 originalMatForCropping.release();
+
+                // Log average inference time per text block (s/it)
+                if (blockCount > 0) {
+                    double avgBlockTimeSec = (totalBlockTime / 1e9) / blockCount;
+                    Log.i("OCR-TIME", "Average inference time per text block: " + avgBlockTimeSec + " s/it (" + blockCount + " blocks)");
+                } else {
+                    Log.i("OCR-TIME", "No text blocks detected for timing.");
+                }
 
                 // Common steps for both languages
                 List<Block> resolvedBlocks = resolveBlocks(resolvedLines);
@@ -1250,19 +1271,41 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
         // ... find views in header ...
         
         if (isLoggedIn) {
-            // Show user info, hide guest view
             guestViewNav.setVisibility(View.GONE);
+            historyRecyclerViewNav.setVisibility(View.VISIBLE);
+            btnNewSessionNav.setVisibility(View.VISIBLE);
+            btnLogoutNav.setVisibility(View.VISIBLE);
+            navSpacer.setVisibility(View.VISIBLE);
             fetchHistory();
         } else {
-            // Show guest view
             guestViewNav.setVisibility(View.VISIBLE);
+            historyRecyclerViewNav.setVisibility(View.GONE);
+            btnNewSessionNav.setVisibility(View.GONE);
+            btnLogoutNav.setVisibility(View.GONE);
+            navSpacer.setVisibility(View.GONE);
         }
 
         btnLoginNav.setOnClickListener(v -> {
-            // Handle login
+            Intent intent = new Intent(MainActivity.this, LoginActivity.class);
+            startActivity(intent);
+            finish();
+        });
+
+        btnLogoutNav.setOnClickListener(v -> {
+            // Clear credentials
+            SharedPreferences.Editor editor = getSharedPreferences("user_prefs", MODE_PRIVATE).edit();
+            editor.remove("isLoggedIn");
+            editor.remove("userId");
+            editor.apply();
+
+            // Restart the activity to apply changes
+            Intent intent = new Intent(MainActivity.this, MainActivity.class);
+            intent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(intent);
+            finish();
         });
         
-        btnNewSession.setOnClickListener(v -> startNewOcrSession());
+        btnNewSessionNav.setOnClickListener(v -> startNewOcrSession());
 
         navigationView.setNavigationItemSelectedListener(item -> {
             // Handle navigation view item clicks here.
@@ -1281,46 +1324,58 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
         client.newCall(request).enqueue(new Callback() {
             @Override
             public void onFailure(@NonNull Call call, @NonNull IOException e) {
-                runOnUiThread(() -> Toast.makeText(MainActivity.this, "Failed to fetch history.", Toast.LENGTH_SHORT).show());
+                Log.e("FetchHistory", "Failed to fetch history", e);
+                runOnUiThread(() -> Toast.makeText(MainActivity.this, "Failed to fetch history: " + e.getMessage(), Toast.LENGTH_SHORT).show());
             }
 
             @Override
             public void onResponse(@NonNull Call call, @NonNull Response response) throws IOException {
+                final String jsonResponse = response.body().string();
+                Log.d("FetchHistory", "Response received: " + jsonResponse);
+
                 if (response.isSuccessful()) {
-                    final String jsonResponse = response.body().string();
                     try {
-                        JSONObject jsonObj = new JSONObject(jsonResponse);
-                        JSONArray sessionsArray = jsonObj.getJSONArray("sessions");
+                        // Parse the response as a JSON array (not an object)
+                        JSONArray sessionsArray = new JSONArray(jsonResponse);
                         historySessionList.clear();
                         for (int i = 0; i < sessionsArray.length(); i++) {
                             JSONObject sessionObj = sessionsArray.getJSONObject(i);
-                            String sessionName = sessionObj.getString("session_name");
-                            String createdAt = sessionObj.getString("created_at");
+                            String timestamp = sessionObj.optString("timestamp", "N/A");
+                            int imageCount = sessionObj.optInt("image_count", 0);
+                            JSONArray resultsArray = sessionObj.getJSONArray("results");
+                            JSONArray imageIdsArray = sessionObj.getJSONArray("image_ids");
 
                             List<HistoryItemDetail> details = new ArrayList<>();
                             List<Integer> imageIds = new ArrayList<>();
-                            JSONArray imagesArray = sessionObj.getJSONArray("images");
 
-                            for(int j=0; j<imagesArray.length(); j++){
-                                JSONObject imageObj = imagesArray.getJSONObject(j);
-                                int imageId = imageObj.getInt("image_id");
-                                String base64 = imageObj.getString("base64_string");
-                                String recognizedText = imageObj.optString("recognized_text", "N/A");
-                                
-                                Uri imageUri = saveBase64ImageToTempFile(base64, String.valueOf(imageId));
-                                if(imageUri != null) {
+                            for (int j = 0; j < resultsArray.length(); j++) {
+                                JSONObject imageObj = resultsArray.getJSONObject(j);
+                                int imageId = imageIdsArray.getInt(j);
+                                String base64 = imageObj.getString("image_base64");
+                                String recognizedText = imageObj.optString("text", "N/A");
+
+                                // Use a unique identifier for each session and image
+                                String uniqueId = "session" + i + "_img" + j + "_id" + imageId;
+                                Uri imageUri = saveBase64ImageToTempFile(base64, uniqueId);
+                                if (imageUri != null) {
                                     details.add(new HistoryItemDetail(imageUri, recognizedText));
                                     imageIds.add(imageId);
                                 }
                             }
-                            historySessionList.add(new HistorySession(sessionName, imagesArray.length(), details, imageIds));
+                            historySessionList.add(new HistorySession(timestamp, imageCount, details, imageIds));
                         }
-                        
-                        runOnUiThread(() -> historyAdapterNav.notifyDataSetChanged());
+                        runOnUiThread(() -> {
+                           historyAdapterNav.notifyDataSetChanged();
+                           Log.d("FetchHistory", "History updated successfully on UI thread.");
+                        });
                         
                     } catch (JSONException e) {
+                         Log.e("FetchHistory", "Error parsing history JSON", e);
                          runOnUiThread(() -> Toast.makeText(MainActivity.this, "Error parsing history.", Toast.LENGTH_SHORT).show());
                     }
+                } else {
+                    Log.e("FetchHistory", "Fetch history failed with code: " + response.code());
+                    runOnUiThread(() -> Toast.makeText(MainActivity.this, "Failed to fetch history (server error)", Toast.LENGTH_SHORT).show());
                 }
             }
         });
@@ -1387,6 +1442,7 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
                     historySessionList.remove(position);
                     historyAdapterNav.notifyItemRemoved(position);
                     historyAdapterNav.notifyItemRangeChanged(position, historySessionList.size());
+                    Log.w("DeleteSession", "Session deleted locally due to missing image IDs.");
                 }
             })
             .setNegativeButton("Cancel", null)
@@ -1404,13 +1460,14 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
 
         RequestBody body = RequestBody.create(json.toString(), MediaType.get("application/json; charset=utf-8"));
         Request request = new Request.Builder()
-                .url(BASE_URL + "/delete_images")
+                .url(BASE_URL + "/history/delete") // Corrected endpoint
                 .post(body)
                 .build();
         
         client.newCall(request).enqueue(new Callback() {
             @Override
             public void onFailure(@NonNull Call call, @NonNull IOException e) {
+                 Log.e("DeleteSession", "Failed to delete session", e);
                  runOnUiThread(() -> Toast.makeText(MainActivity.this, "Failed to delete session.", Toast.LENGTH_SHORT).show());
             }
 
@@ -1421,7 +1478,7 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
                     runOnUiThread(() -> {
                         try {
                             JSONObject json = new JSONObject(responseBody);
-                            if (json.has("message") && json.getString("message").equals("Session deleted successfully")) {
+                            if (json.has("message")) {
                                 historySessionList.remove(position);
                                 historyAdapterNav.notifyItemRemoved(position);
                                 historyAdapterNav.notifyItemRangeChanged(position, historySessionList.size());
@@ -1435,6 +1492,7 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
                         }
                     });
                 } else {
+                    Log.e("DeleteSession", "Delete failed with code: " + response.code());
                     runOnUiThread(() -> Toast.makeText(MainActivity.this, "Delete failed: " + response.message(), Toast.LENGTH_SHORT).show());
                 }
             }
@@ -1520,6 +1578,7 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
         btnRunOcr.setEnabled(!isRunning);
         btnStopOcr.setEnabled(isRunning);
         btnExport.setEnabled(!isRunning && !ocrResultList.isEmpty());
+        btnSaveSession.setVisibility(isLoggedIn && !ocrResultList.isEmpty() && !isRunning ? View.VISIBLE : View.GONE);
         fab.setEnabled(!isRunning);
     }
     
@@ -1630,7 +1689,6 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
             intent.setType("application/pdf");
             intent.putExtra(Intent.EXTRA_TITLE, "OCR_Result.pdf");
             startActivityForResult(intent, REQUEST_CODE_CREATE_PDF);
-            pendingExportPdfUri = null; // reset
             return;
         } else if ("docx".equals(format)) {
             Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
@@ -1814,5 +1872,43 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
             }
         }
         return fullText.toString();
+    }
+
+    private void saveCurrentSession() {
+        if (!isLoggedIn) {
+            Toast.makeText(this, "You must be logged in to save the session.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (ocrResultList.isEmpty() || ocrResultList.stream().allMatch(r -> r.isProcessing() || r.getError() != null)) {
+            Toast.makeText(this, "There are no valid results to save.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        AtomicInteger savedCount = new AtomicInteger(0);
+        for (OcrResult result : ocrResultList) {
+            // Only save results that are complete and don't have errors
+            if (!result.isProcessing() && result.getError() == null) {
+                Uri imageUri = result.getImageUri();
+                String textToSave = null;
+
+                if (result.getPage() != null && result.getPage().getContent() != null) {
+                    textToSave = result.getPage().getContent(); // Use corrected text if available
+                } else if (result.getText() != null) {
+                    textToSave = result.getText(); // Fallback to original text (e.g., from history)
+                }
+
+                if (textToSave != null) {
+                    uploadOcrResultToBackend(userId, imageUri, textToSave);
+                    savedCount.incrementAndGet();
+                }
+            }
+        }
+
+        if (savedCount.get() > 0) {
+            Toast.makeText(this, savedCount.get() + " " + (savedCount.get() > 1 ? "results" : "result") + " saved to history.", Toast.LENGTH_LONG).show();
+            btnSaveSession.setEnabled(false); // Disable after saving to prevent duplicates
+        } else {
+            Toast.makeText(this, "No new results were saved.", Toast.LENGTH_SHORT).show();
+        }
     }
 }

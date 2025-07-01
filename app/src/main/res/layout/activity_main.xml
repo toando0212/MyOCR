@@ -93,6 +93,15 @@
                 android:layout_height="wrap_content"
                 android:text="Xuất ra PDF hoặc DOCX" />
 
+            <Button
+                android:id="@+id/btnSaveSession"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/save_session"
+                android:visibility="gone"
+                style="@style/Widget.AppCompat.Button.Colored"
+                />
+
             <TextView
                 android:id="@+id/tvSelectLanguage"
                 android:layout_width="wrap_content"
@@ -149,15 +158,6 @@
                 android:layout_width="match_parent"
                 android:layout_height="0dp" />
 
-            <Button
-                android:id="@+id/btn_new_session"
-                style="@style/Widget.MaterialComponents.Button.TextButton.Icon"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:text="@string/new_ocr_session"
-                android:layout_margin="8dp"
-                app:icon="@android:drawable/ic_input_add" />
-
             <TextView
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -193,15 +193,56 @@
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:text="@string/login"/>
+
+                <Button
+                    android:id="@+id/btn_new_session"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="New Session" />
             </LinearLayout>
 
             <!-- Logged In View -->
             <androidx.recyclerview.widget.RecyclerView
                 android:id="@+id/history_recycler_view_nav"
                 android:layout_width="match_parent"
-                android:layout_height="match_parent"
+                android:layout_height="0dp"
+                android:layout_weight="1"
                 tools:listitem="@layout/item_ocr_result"
                 android:visibility="gone"/>
+
+            <!-- "New Session" Button for logged-in users -->
+            <Button
+                android:id="@+id/btn_new_session_nav"
+                style="?android:attr/borderlessButtonStyle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="16dp"
+                android:layout_marginEnd="16dp"
+                android:layout_marginTop="8dp"
+                android:text="@string/new_session"
+                android:visibility="gone"
+                />
+
+            <!-- Spacer to push logout to the bottom -->
+            <View
+                android:id="@+id/nav_spacer"
+                android:layout_width="match_parent"
+                android:layout_height="0dp"
+                android:layout_weight="1"
+                android:visibility="gone"/>
+
+            <!-- Logged In View -->
+            <Button
+                android:id="@+id/btn_logout_nav"
+                style="?android:attr/borderlessButtonStyle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="16dp"
+                android:layout_marginEnd="16dp"
+                android:layout_marginBottom="16dp"
+                android:text="@string/logout"
+                android:textColor="?attr/colorError"
+                android:visibility="gone" />
 
         </LinearLayout>
     </com.google.android.material.navigation.NavigationView>

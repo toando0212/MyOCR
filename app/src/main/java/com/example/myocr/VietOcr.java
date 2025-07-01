@@ -48,8 +48,21 @@ public class VietOcr {
         long[] shape = {1, 3, 32, 128};
         try (OnnxTensor inputTensor = OnnxTensor.createTensor(env, imageBuffer, shape)) {
             OrtSession.Result result = crnnSession.run(Collections.singletonMap("input", inputTensor));
-            float[][][] logits = (float[][][]) result.get(0).getValue();
-            return vocab.decode(logits);
+            Object output = result.get(0).getValue();
+            if (output instanceof float[][][]) {
+                float[][][] logits = (float[][][]) output;
+                return vocab.decode(logits);
+            } else if (output instanceof float[][]) {
+                float[][] logits2d = (float[][]) output;
+                // Add batch dimension: [1, timesteps, num_classes]
+                float[][][] logits = new float[1][logits2d.length][logits2d[0].length];
+                for (int t = 0; t < logits2d.length; t++) {
+                    System.arraycopy(logits2d[t], 0, logits[0][t], 0, logits2d[0].length);
+                }
+                return vocab.decode(logits);
+            } else {
+                throw new IllegalStateException("Unexpected ONNX output type: " + output.getClass().getName());
+            }
         }
     }
 
