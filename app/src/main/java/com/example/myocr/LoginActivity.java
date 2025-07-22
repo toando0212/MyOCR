@@ -41,7 +41,7 @@ public class LoginActivity extends AppCompatActivity {
             .writeTimeout(60, TimeUnit.SECONDS)
             .readTimeout(60, TimeUnit.SECONDS)
             .build();
-    public static final String BASE_URL = "http://192.168.1.229:5000"; 
+    public static final String BASE_URL = "http://172.20.10.3:5000"; 
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {

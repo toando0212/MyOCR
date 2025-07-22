@@ -122,4 +122,129 @@ public class VietOcr {
         }
         return results;
     }
+
+    //hàm chạy mô hìndh nhận diện
+    public List<String> predictBatch(List<Bitmap> bitmaps) throws Exception {
+        List<String> results = new ArrayList<>();
+        if (bitmaps.isEmpty()) return results;
+
+        int batchSize = bitmaps.size();
+        int targetW = 128, targetH = 32;
+        FloatBuffer batchBuffer = FloatBuffer.allocate(batchSize * 3 * targetH * targetW);
+        float[] mean = {0.694f, 0.695f, 0.693f};
+        float[] std = {0.299f, 0.296f, 0.301f};
+
+        for (int batchIndex = 0; batchIndex < batchSize; batchIndex++) {
+            Bitmap bitmap = bitmaps.get(batchIndex);
+            Bitmap resized = Bitmap.createScaledBitmap(bitmap, targetW, targetH, true);
+            int[] pixels = new int[targetW * targetH];
+            resized.getPixels(pixels, 0, targetW, 0, 0, targetW, targetH);
+            for (int y = 0; y < targetH; y++) {
+                for (int x = 0; x < targetW; x++) {
+                    int pixel = pixels[y * targetW + x];
+                    float r = ((Color.red(pixel) / 255.0f) - mean[0]) / std[0];
+                    float g = ((Color.green(pixel) / 255.0f) - mean[1]) / std[1];
+                    float b = ((Color.blue(pixel) / 255.0f) - mean[2]) / std[2];
+                    int imageBaseIndex = batchIndex * 3 * targetH * targetW;
+                    int pixelIndex = y * targetW + x;
+                    batchBuffer.put(imageBaseIndex + pixelIndex, r);
+                    batchBuffer.put(imageBaseIndex + targetH * targetW + pixelIndex, g);
+                    batchBuffer.put(imageBaseIndex + 2 * targetH * targetW + pixelIndex, b);
+                }
+            }
+            resized.recycle();
+        }
+        batchBuffer.rewind();
+
+        long[] shape = {batchSize, 3, targetH, targetW};
+        try (OnnxTensor inputTensor = OnnxTensor.createTensor(env, batchBuffer, shape)) {
+            OrtSession.Result result = crnnSession.run(Collections.singletonMap("input", inputTensor));
+            Object output = result.get(0).getValue();
+            if (output instanceof float[][][]) {
+                float[][][] logits = (float[][][]) output;
+                for (int batchIndex = 0; batchIndex < batchSize; batchIndex++) {
+                    float[][][] singleLogit = new float[1][logits[batchIndex].length][logits[batchIndex][0].length];
+                    for (int t = 0; t < logits[batchIndex].length; t++) {
+                        System.arraycopy(logits[batchIndex][t], 0, singleLogit[0][t], 0, logits[batchIndex][0].length);
+                    }
+                    results.add(vocab.decode(singleLogit));
+                }
+            } else if (output instanceof float[][]) {
+                float[][] logits2d = (float[][]) output;
+                int timesteps = logits2d.length / batchSize;
+                for (int batchIndex = 0; batchIndex < batchSize; batchIndex++) {
+                    float[][][] singleLogit = new float[1][timesteps][logits2d[0].length];
+                    for (int t = 0; t < timesteps; t++) {
+                        System.arraycopy(logits2d[batchIndex * timesteps + t], 0, singleLogit[0][t], 0, logits2d[0].length);
+                    }
+                    results.add(vocab.decode(singleLogit));
+                }
+            } else {
+                throw new IllegalStateException("Unexpected ONNX output type: " + output.getClass().getName());
+            }
+        }
+        return results;
+    }
+
+    public List<String> predictBatchEnglish(List<Bitmap> bitmaps, OrtEnvironment env, OrtSession session, Vocab vocab) throws Exception {
+        List<String> results = new ArrayList<>();
+        if (bitmaps.isEmpty()) return results;
+
+        int batchSize = bitmaps.size();
+        int targetW = 128, targetH = 32;
+        FloatBuffer batchBuffer = FloatBuffer.allocate(batchSize * 3 * targetH * targetW);
+        float[] mean = {0.694f, 0.695f, 0.693f};
+        float[] std = {0.299f, 0.296f, 0.301f};
+
+        for (int batchIndex = 0; batchIndex < batchSize; batchIndex++) {
+            Bitmap bitmap = bitmaps.get(batchIndex);
+            Bitmap resized = Bitmap.createScaledBitmap(bitmap, targetW, targetH, true);
+            int[] pixels = new int[targetW * targetH];
+            resized.getPixels(pixels, 0, targetW, 0, 0, targetW, targetH);
+            for (int y = 0; y < targetH; y++) {
+                for (int x = 0; x < targetW; x++) {
+                    int pixel = pixels[y * targetW + x];
+                    float r = ((Color.red(pixel) / 255.0f) - mean[0]) / std[0];
+                    float g = ((Color.green(pixel) / 255.0f) - mean[1]) / std[1];
+                    float b = ((Color.blue(pixel) / 255.0f) - mean[2]) / std[2];
+                    int imageBaseIndex = batchIndex * 3 * targetH * targetW;
+                    int pixelIndex = y * targetW + x;
+                    batchBuffer.put(imageBaseIndex + pixelIndex, r);
+                    batchBuffer.put(imageBaseIndex + targetH * targetW + pixelIndex, g);
+                    batchBuffer.put(imageBaseIndex + 2 * targetH * targetW + pixelIndex, b);
+                }
+            }
+            resized.recycle();
+        }
+        batchBuffer.rewind();
+
+        long[] shape = {batchSize, 3, targetH, targetW};
+        try (OnnxTensor inputTensor = OnnxTensor.createTensor(env, batchBuffer, shape)) {
+            OrtSession.Result result = session.run(Collections.singletonMap("input", inputTensor));
+            Object output = result.get(0).getValue();
+            if (output instanceof float[][][]) {
+                float[][][] logits = (float[][][]) output;
+                for (int batchIndex = 0; batchIndex < batchSize; batchIndex++) {
+                    float[][][] singleLogit = new float[1][logits[batchIndex].length][logits[batchIndex][0].length];
+                    for (int t = 0; t < logits[batchIndex].length; t++) {
+                        System.arraycopy(logits[batchIndex][t], 0, singleLogit[0][t], 0, logits[batchIndex][0].length);
+                    }
+                    results.add(vocab.decode(singleLogit));
+                }
+            } else if (output instanceof float[][]) {
+                float[][] logits2d = (float[][]) output;
+                int timesteps = logits2d.length / batchSize;
+                for (int batchIndex = 0; batchIndex < batchSize; batchIndex++) {
+                    float[][][] singleLogit = new float[1][timesteps][logits2d[0].length];
+                    for (int t = 0; t < timesteps; t++) {
+                        System.arraycopy(logits2d[batchIndex * timesteps + t], 0, singleLogit[0][t], 0, logits2d[0].length);
+                    }
+                    results.add(vocab.decode(singleLogit));
+                }
+            } else {
+                throw new IllegalStateException("Unexpected ONNX output type: " + output.getClass().getName());
+            }
+        }
+        return results;
+    }
 }

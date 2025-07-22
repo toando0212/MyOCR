@@ -285,6 +285,8 @@ public class ImageViewerActivity extends AppCompatActivity implements ThumbnailA
     
     private void saveAndFinish() {
         ArrayList<Uri> finalUris = new ArrayList<>();
+
+        //quản lý bộ nhớ tốt hơn bằng cách sử dụng ExecutorService, quản lý luồng xử lý ảnh
         ExecutorService executor = Executors.newSingleThreadExecutor();
         Handler handler = new Handler(Looper.getMainLooper());
         progressBar.setVisibility(View.VISIBLE);
@@ -495,6 +497,7 @@ public class ImageViewerActivity extends AppCompatActivity implements ThumbnailA
         return true;
     }
 
+    //====== Tìm 4 góc tài liệu và Hiệu chỉnh phối cảnh ======
     private PointF[] findDocumentCorners(Bitmap bitmap) {
         // This is a new implementation based on the GrabCut pipeline for robustness.
         if (bitmap == null || bitmap.isRecycled()) return null;

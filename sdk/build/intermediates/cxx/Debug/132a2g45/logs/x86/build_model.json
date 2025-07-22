@@ -27,10 +27,7 @@
     "variantName": "debug",
     "isDebuggableEnabled": true,
     "validAbiList": [
-      "armeabi-v7a",
-      "arm64-v8a",
-      "x86",
-      "x86_64"
+      "x86"
     ],
     "buildTargetSet": [
       "opencv_jni_shared"
@@ -147,6 +144,7 @@
         "rootBuildGradleFolder": "D:\\MyOCR\\MyOCR",
         "sdkFolder": "C:\\Users\\quang\\AppData\\Local\\Android\\Sdk",
         "isBuildOnlyTargetAbiEnabled": true,
+        "ideBuildTargetAbi": "x86",
         "isCmakeBuildCohabitationEnabled": false,
         "isPrefabEnabled": false
       },

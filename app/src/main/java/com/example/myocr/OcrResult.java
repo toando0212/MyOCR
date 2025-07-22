@@ -69,4 +69,8 @@ public class OcrResult {
         }
         return recognizedText != null ? recognizedText : "";
     }
+
+    public void setText(String text) {
+        this.recognizedText = text;
+    }
 } 

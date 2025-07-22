@@ -3,11 +3,12 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 import onnxruntime as ort
 import cv2
-from pyvi import ViTokenizer
+# from pyvi import ViTokenizer
 from doctr.models.recognition.crnn import crnn_mobilenet_v3_large
 import torch
 from torchvision import transforms
 import pyclipper
+import time
 
 VOCAB = list("aAàÀảẢãÃáÁạẠăĂằẰẳẲẵẴắẮặẶâÂầẦẩẨẫẪấẤậẬbBcCdDđĐeEèÈẻẺẽẼéÉẹẸêÊềỀểỂễỄếẾệỆfFgGhHiIìÌỉỈĩĨíÍịỊjJkKlLmMnNoOòÒỏỎõÕóÓọỌôÔồỒổỔỗỖốỐộỘơƠờỜởỞỡỠớỚợỢpPqQrRsStTuUùÙủỦũŨúÚụỤưƯừỪửỬữỮứỨựỰvVwWxXyYỳỲỷỶỹỸýÝỵỴzZ0123456789!\"#$%&''()*+,-./:;<=>?@[\\]^_`{|}~")
 # --- Perspective transform from 4 points ---
@@ -129,8 +130,11 @@ class DBNetDetector:
 
     def detect(self, pil_img):
         img_np, orig_size, resized_w, resized_h, pad_left, pad_top = self.preprocess(pil_img)
+        start_time = time.time()
         ort_inputs = {self.session.get_inputs()[0].name: img_np}
         pred = self.session.run(None, ort_inputs)[0]
+        inference_time = time.time() - start_time
+        print(f"[DBNet] Inference time (batch 1): {inference_time:.3f} seconds")
         boxes = self.postprocess(pred, orig_size, resized_w, resized_h, pad_left, pad_top)
         return boxes
 
@@ -146,7 +150,7 @@ def post_process_text(text: str) -> str:
 # --- PyTorch CRNN Recognizer ---
 crnn_model = crnn_mobilenet_v3_large(pretrained=False, vocab=VOCAB)
 # crnn_model = crnn_model.cuda()
-checkpoint = torch.load("best_checkpoint_(1).pth", map_location="cpu")
+checkpoint = torch.load("best_checkpoint_printed3.pth", map_location="cpu")
 crnn_model.load_state_dict(checkpoint["model_state_dict"])
 crnn_model.eval()
 
@@ -158,10 +162,13 @@ crnn_transform = transforms.Compose([
 
 def recognize_pytorch(img_pil):
     img = crnn_transform(img_pil.convert("RGB")).unsqueeze(0)
+    start_time = time.time()
     with torch.no_grad():
         out = crnn_model(img)
+    inference_time = time.time() - start_time
     preds = out["preds"]
     text, conf = preds[0]
+    # print(f"[CRNN] Inference time (single box): {inference_time:.3f} seconds")
     return text
 
 # --- Instantiate models ---
@@ -179,36 +186,60 @@ def ocr_pipeline(img):
     results = []
     vis_img = img.copy().convert("RGB")
     draw = ImageDraw.Draw(vis_img)
-    for box in boxes:
-        xmin = int(np.min(box[:,0]))
-        xmax = int(np.max(box[:,0]))
-        ymin = int(np.min(box[:,1]))
-        ymax = int(np.max(box[:,1]))
-        print(f"[OCR] Crop box: ({xmin},{ymin})-({xmax},{ymax})")
-        if xmax-xmin<5 or ymax-ymin<5:
+    batch_size = 64
+    total_inference_time = 0
+    batch_count = 0
+    batch_times = []
+    for i in range(0, len(boxes), batch_size):
+        batch_boxes = boxes[i:i + batch_size]
+        batch_tensors = []
+        valid_batch_boxes = []
+        for box in batch_boxes:
+            xmin = int(np.min(box[:,0]))
+            xmax = int(np.max(box[:,0]))
+            ymin = int(np.min(box[:,1]))
+            ymax = int(np.max(box[:,1]))
+            if xmax-xmin<5 or ymax-ymin<5:
+                continue
+            w = xmax - xmin
+            h = ymax - ymin
+            expand_w = int(w * 0.1)
+            expand_h = int(h * 0.1)
+            xmin_exp = max(0, xmin - expand_w)
+            ymin_exp = max(0, ymin - expand_h)
+            xmax_exp = min(img.width, xmax + expand_w)
+            ymax_exp = min(img.height, ymax + expand_h)
+            crop = img.crop((xmin_exp, ymin_exp, xmax_exp, ymax_exp))
+            tensor = crnn_transform(crop.convert("RGB"))
+            batch_tensors.append(tensor)
+            valid_batch_boxes.append(box)
+        if not batch_tensors:
             continue
-        # --- Expand box by 10% each side ---
-        w = xmax - xmin
-        h = ymax - ymin
-        expand_w = int(w * 0.1)
-        expand_h = int(h * 0.1)
-        xmin_exp = max(0, xmin - expand_w)
-        ymin_exp = max(0, ymin - expand_h)
-        xmax_exp = min(img.width, xmax + expand_w)
-        ymax_exp = min(img.height, ymax + expand_h)
-        crop = img.crop((xmin_exp, ymin_exp, xmax_exp, ymax_exp))
-        text = recognize_pytorch(crop)
-        if text.strip():
-            results.append((box, text))
-            draw.polygon([tuple(pt) for pt in box], outline="blue")
-            try:
-                font = ImageFont.truetype("arial.ttf", 15)
-            except:
-                font = ImageFont.load_default()
-            draw.text((xmin, ymin-15 if ymin>15 else ymin), text, fill="blue", font=font)
+        batch = torch.stack(batch_tensors)  # Shape: [N, 3, 32, 128]
+        batch_start_time = time.time()
+        with torch.no_grad():
+            out = crnn_model(batch)
+        batch_inference_time = time.time() - batch_start_time
+        total_inference_time += batch_inference_time
+        batch_count += 1
+        batch_times.append(batch_inference_time)
+        print(f"[CRNN] Inference time for batch {batch_count} (size {len(valid_batch_boxes)}): {batch_inference_time:.3f} seconds")
+        preds = out["preds"]  # Đây là list (text, conf) cho cả batch
+        for j, (text, conf) in enumerate(preds):
+            box = valid_batch_boxes[j]
+            if text.strip():
+                results.append((box, text))
+                draw.polygon([tuple(pt) for pt in box], outline="blue")
+                try:
+                    font = ImageFont.truetype("arial.ttf", 15)
+                except:
+                    font = ImageFont.load_default()
+                draw.text((xmin, ymin-15 if ymin>15 else ymin), text, fill="blue", font=font)
+    if batch_count > 0:
+        avg_batch_time = total_inference_time / batch_count
+        print(f"[CRNN] Average inference time per batch (batch size {batch_size}): {avg_batch_time:.3f} seconds")
     out_text = '\n'.join([t for _,t in results])
     post_text = post_process_text(out_text)
-    print(f"[OCR] Final recognized text: {post_text}")
     return post_text, vis_img
 
 # --- Gradio interface ---

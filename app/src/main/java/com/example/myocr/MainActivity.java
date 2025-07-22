@@ -156,7 +156,7 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
             .writeTimeout(60, TimeUnit.SECONDS)
             .readTimeout(60, TimeUnit.SECONDS)
             .build();
-    public static final String BASE_URL = "http://192.168.1.229:5000"; // 
+    public static final String BASE_URL = "http://172.20.10.3:5000"; // 
 
     private Uri pendingExportPdfUri = null;
 
@@ -445,6 +445,7 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
         // Lazy load the models on first OCR run
         if (detectionSession == null || englishRecognitionSession == null || vietOcr == null) {
              Toast.makeText(this, "Loading models, please wait...", Toast.LENGTH_LONG).show();
+             // chạy ở background để tránh treo hệ thống tràn ram
              new Thread(() -> {
                  try {
                     // Load English models
@@ -507,6 +508,7 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
     }
     
     private void performOcrForImage(Uri imageUri, final int position, final String selectedLang) {
+        //chạy ở background để tránh treo hệ thống, tràn ram
         new Thread(() -> {
             Page resultPage = null;
             try {
@@ -517,8 +519,18 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
                 Bitmap cleanedBitmap = Bitmap.createBitmap(originalMat.cols(), originalMat.rows(), Bitmap.Config.ARGB_8888);
                 Utils.matToBitmap(originalMat, cleanedBitmap);
 
-                // Common steps for both languages
+                // Warmup phase for detection is removed to prevent system hang
+                Log.i("OCR-TIME", "Detection warmup phase skipped to optimize performance");
+
+                // Timing for detection with batch size 1 for a single run
+                long startDetection = System.nanoTime();
+
+                //Thực thi detection
                 List<RotatedRect> detectionBoxes = runDetection(cleanedBitmap);
+                long endDetection = System.nanoTime();
+                double detectionTimeSec = (endDetection - startDetection) / 1e9;
+                Log.i("OCR-TIME", "Detection inference time (batch 1, single run): " + detectionTimeSec + " seconds");
+
                 Log.d("OcrDebugging", "Found " + detectionBoxes.size() + " boxes in detection phase for lang: " + selectedLang);
                 List<List<WordBox>> lineWordBoxes = resolveLines(detectionBoxes);
 
@@ -530,8 +542,10 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
                 long totalBlockTime = 0;
                 int blockCount = 0;
 
+                // Prepare for batch recognition
+                List<Bitmap> croppedBitmaps = new ArrayList<>();
+                List<WordBox> wordBoxesForRecognition = new ArrayList<>();
                 for (List<WordBox> wordBoxLine : lineWordBoxes) {
-                    List<Word> wordsInLine = new ArrayList<>();
                     for (WordBox wordBox : wordBoxLine) {
                         Rect uprightBox = wordBox.box.boundingRect();
                         int x = Math.max(0, uprightBox.x);
@@ -545,31 +559,60 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
                         Mat croppedMat = new Mat(originalMatForCropping, clampedBox);
                         Bitmap croppedBitmap = Bitmap.createBitmap(croppedMat.cols(), croppedMat.rows(), Bitmap.Config.ARGB_8888);
                         Utils.matToBitmap(croppedMat, croppedBitmap);
-
-                        String recognizedText = "";
-                        double confidence = 0.95; // Placeholder confidence
-
-                        long startBlock = System.nanoTime();
-                        if ("vi".equals(selectedLang)) {
-                            if (vietOcr == null) throw new IOException("Vietnamese OCR model is not initialized.");
-                            recognizedText = vietOcr.predict(croppedBitmap);
-                        } else {
-                            if (englishRecognitionSession == null || englishVocab == null) throw new IOException("English OCR model is not initialized.");
-                            FloatBuffer recInputBuffer = preprocessImageForRecognition(croppedBitmap);
-                            long[] recShape = {1, 3, 32, 128};
-                            try (OnnxTensor recInputTensor = OnnxTensor.createTensor(ortEnv, recInputBuffer, recShape)) {
-                                OrtSession.Result recResult = englishRecognitionSession.run(Collections.singletonMap("input", recInputTensor));
-                                float[][][] recOutput = (float[][][]) recResult.get(0).getValue();
-                                recognizedText = englishVocab.decode(recOutput);
-                            }
-                        }
-                        long endBlock = System.nanoTime();
-                        totalBlockTime += (endBlock - startBlock);
-                        blockCount++;
-
-                        wordsInLine.add(new Word(recognizedText, confidence, wordBox.box));
+                        croppedBitmaps.add(croppedBitmap);
+                        wordBoxesForRecognition.add(wordBox);
                         croppedMat.release();
+                    }
+                }
+
+                // Warmup phase for recognition is removed to prevent system hang
+                Log.i("OCR-TIME", "Recognition warmup phase skipped to optimize performance");
+
+                // Process recognition in batches of 64 with timing for a single run
+                //chia batch 64 cunxg tránh tran ram
+                int batchSize = 64;
+                long totalRecognitionTime = 0;
+                int totalBatches = (int) Math.ceil((double) croppedBitmaps.size() / batchSize);
+                Log.i("OCR-TIME", "Recognition timing for a single run (total bitmaps: " + croppedBitmaps.size() + ")");
+                List<String> recognitionResults = new ArrayList<>();
+                for (int batch = 0; batch < totalBatches; batch++) {
+                    int startIndex = batch * batchSize;
+                    int endIndex = Math.min(startIndex + batchSize, croppedBitmaps.size());
+                    List<Bitmap> batchBitmaps = croppedBitmaps.subList(startIndex, endIndex);
+
+                    long startRecognition = System.nanoTime();
+                    List<String> batchResults;
+                    if ("vi".equals(selectedLang)) {
+                        if (vietOcr == null) throw new IOException("Vietnamese OCR model is not initialized.");
+                        //Thực thi nhận diện tiếng Việt
+                        batchResults = vietOcr.predictBatch(batchBitmaps);
+                    } else {
+                        //thhực thi nhận diện tiếng Anh
+                        if (englishRecognitionSession == null || englishVocab == null) throw new IOException("English OCR model is not initialized.");
+                        batchResults = vietOcr.predictBatchEnglish(batchBitmaps, ortEnv, englishRecognitionSession, englishVocab);
+                    }
+                    long endRecognition = System.nanoTime();
+                    long batchRecognitionTime = endRecognition - startRecognition;
+                    totalRecognitionTime += batchRecognitionTime;
+                    double batchRecognitionTimeSec = batchRecognitionTime / 1e9;
+                    Log.i("OCR-TIME", "Recognition inference time (batch " + (batch + 1) + "/" + totalBatches + ", size " + batchBitmaps.size() + "): " + batchRecognitionTimeSec + " seconds");
+                    recognitionResults.addAll(batchResults);
+                }
+                double avgRecognitionTimeSec = (totalRecognitionTime / 1e9) / totalBatches;
+                Log.i("OCR-TIME", "Average recognition inference time per batch (batch size 64, single run): " + avgRecognitionTimeSec + " seconds");
+
+                // Now assign results to lines
+                int bitmapIndex = 0;
+                for (List<WordBox> wordBoxLine : lineWordBoxes) {
+                    List<Word> wordsInLine = new ArrayList<>();
+                    for (WordBox wordBox : wordBoxLine) {
+                        if (bitmapIndex >= croppedBitmaps.size()) break;
+                        Bitmap croppedBitmap = croppedBitmaps.get(bitmapIndex);
+                        String recognizedText = recognitionResults.get(bitmapIndex);
+                        double confidence = 0.95; // Placeholder confidence
+                        wordsInLine.add(new Word(recognizedText, confidence, wordBox.box));
                         croppedBitmap.recycle();
+                        bitmapIndex++;
                     }
 
                     if (!wordsInLine.isEmpty()) {
@@ -679,6 +722,7 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
         horizontalLines.release();
     }
 
+    //======chạy mô hình detection DBNet========
     private List<RotatedRect> runDetection(Bitmap bitmap) throws Exception {
         int targetSize = 1024; // Changed to 1024 to match DBNet input size
         // The ratio of the original image
@@ -714,10 +758,14 @@ public class MainActivity extends AppCompatActivity implements ImageAdapter.OnIm
             // The model has a single output: logits
             float[][][][] logits = (float[][][][]) result.get(0).getValue();
             // The actual post-processing happens here
+
+            //thực thi hậu xử lý đầu ra của mô hình DBNet
             return decodeDetectionOutput(logits, bitmap.getWidth(), bitmap.getHeight(), 0.1f, resizedWidth, resizedHeight, left, top);
         }
     }
 
+
+    //=====Hậu xử lý đầu ra của mô hình DBNet=====
     private List<RotatedRect> decodeDetectionOutput(float[][][][] logits, int originalWidth, int originalHeight, float boxThreshold, int resizedWidth, int resizedHeight, int padLeft, int padTop) {
         // This function now implements post-processing for a DBNet-like model.
         // The model output is a probability map (logits).

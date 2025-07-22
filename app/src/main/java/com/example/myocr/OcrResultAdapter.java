@@ -383,6 +383,7 @@ public class OcrResultAdapter extends RecyclerView.Adapter<OcrResultAdapter.View
             if (result.getPage() != null) {
                 result.getPage().updateContent(correctedText);
             }
+            result.setText(correctedText); // Đảm bảo luôn cập nhật text mới
             notifyItemChanged(position);
             Toast.makeText(context, toastApplied, Toast.LENGTH_SHORT).show();
             btnSpellCheck.setEnabled(true);
